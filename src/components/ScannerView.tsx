@@ -31,6 +31,15 @@ export function ScannerView() {
   const [cameras, setCameras] = useState<{ id: string; label: string }[]>([]);
   const [cameraId, setCameraId] = useState("");
   const [running, setRunning] = useState(false);
+  const [scannerReadiness, setScannerReadiness] = useState<{
+    secure: boolean;
+    cameraApi: boolean;
+    permission: "granted" | "denied" | "prompt" | "unknown";
+  }>({
+    secure: true,
+    cameraApi: true,
+    permission: "unknown",
+  });
   const [manualId, setManualId] = useState("");
   const [manualOpen, setManualOpen] = useState(false);
   const manualWrapRef = useRef<HTMLDivElement | null>(null);
@@ -182,6 +191,54 @@ export function ScannerView() {
 
   useEffect(() => {
     refreshCameras();
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+
+    async function refreshScannerReadiness() {
+      const secure =
+        typeof window !== "undefined"
+          ? window.isSecureContext || window.location.hostname === "localhost"
+          : true;
+      const cameraApi =
+        typeof navigator !== "undefined" &&
+        Boolean(navigator.mediaDevices?.getUserMedia);
+
+      let permission: "granted" | "denied" | "prompt" | "unknown" = "unknown";
+      try {
+        if (
+          typeof navigator !== "undefined" &&
+          "permissions" in navigator &&
+          navigator.permissions?.query
+        ) {
+          const res = await navigator.permissions.query({
+            name: "camera" as PermissionName,
+          });
+          permission =
+            res.state === "granted" || res.state === "denied" || res.state === "prompt"
+              ? res.state
+              : "unknown";
+        }
+      } catch {
+        permission = "unknown";
+      }
+
+      if (!mounted) return;
+      setScannerReadiness({ secure, cameraApi, permission });
+    }
+
+    void refreshScannerReadiness();
+    const onVisibility = () => {
+      if (!document.hidden) void refreshScannerReadiness();
+    };
+    window.addEventListener("focus", onVisibility);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      mounted = false;
+      window.removeEventListener("focus", onVisibility);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
   }, []);
 
   async function startScanner() {
@@ -682,6 +739,25 @@ export function ScannerView() {
 
         <Card id="kiosk-scanner-section" className="flex flex-col scroll-mt-4">
           <SectionTitle>3. Kiosk Scanner</SectionTitle>
+          <div className="mt-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-[11px] font-medium text-slate-600">
+            <span className="font-bold text-slate-700">Scanner readiness:</span>{" "}
+            {scannerReadiness.secure ? "Secure Context OK" : "Needs HTTPS"} ·{" "}
+            {scannerReadiness.cameraApi ? "Camera API OK" : "Camera API Missing"} ·{" "}
+            Permission:{" "}
+            <span
+              className={
+                scannerReadiness.permission === "granted"
+                  ? "text-emerald-700"
+                  : scannerReadiness.permission === "denied"
+                    ? "text-red-600"
+                    : scannerReadiness.permission === "prompt"
+                      ? "text-amber-700"
+                      : "text-slate-500"
+              }
+            >
+              {scannerReadiness.permission}
+            </span>
+          </div>
           <div className="mb-3" />
           <Field label="Select Camera Hardware">
             <select
