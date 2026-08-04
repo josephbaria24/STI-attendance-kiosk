@@ -22,7 +22,9 @@ export const metadata: Metadata = {
     title: "AttendX",
   },
   icons: {
-    apple: "https://cdn-icons-png.flaticon.com/512/3000/3000155.png",
+    icon: "/favicon.ico",
+    shortcut: "/favicon.ico",
+    apple: "/favicon.ico",
   },
 };
 
