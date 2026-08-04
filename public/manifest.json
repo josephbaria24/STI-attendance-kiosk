@@ -1,0 +1,17 @@
+{
+  "name": "AttendX",
+  "short_name": "AttendX",
+  "description": "Attendance Pro kiosk — QR scan, roster, analytics",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#006241",
+  "theme_color": "#006241",
+  "icons": [
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/3000/3000155.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

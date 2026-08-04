@@ -1,26 +1,249 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --sidebar: #006241;
+  --sidebar-deep: #004d33;
+  --sidebar-hover: #007a52;
+  --accent-sky: #38bdf8;
+  --accent-sky-soft: #e0f2fe;
+  --brand-green: #004953;
+  --brand-green-deep: #003740;
+  --primary: #004953;
+  --primary-hover: #003740;
+  --surface: #ffffff;
+  --surface-solid: #ffffff;
+  --text: #0f172a;
+  --muted: #64748b;
+  --border: rgba(226, 232, 240, 0.9);
+  --success: #004953;
+  --warning: #f59e0b;
+  --danger: #ef4444;
+  --teal: #0d9488;
+  --violet: #7c3aed;
+  --background: #043927;
+  --foreground: #0f172a;
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+  --font-sans: var(--font-sans);
+  --font-display: var(--font-sans);
+  --font-mono: var(--font-mono);
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  color: var(--text);
+  font-family: var(--font-sans), system-ui, sans-serif;
+  background: #043927;
+}
+
+button,
+[type="button"],
+[type="submit"],
+[type="reset"],
+[role="button"],
+a,
+label.btn-upload,
+label[class*="cursor-pointer"],
+select,
+summary,
+.nav-item-anim,
+.mode-btn-anim {
+  cursor: pointer;
+}
+
+button:disabled,
+[type="button"]:disabled,
+[type="submit"]:disabled,
+[aria-disabled="true"] {
+  cursor: not-allowed;
+}
+
+@keyframes slideInRight {
+  from {
+    transform: translateX(120%);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+@keyframes fadeUp {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes scaleIn {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.app-shell {
+  background:
+    radial-gradient(ellipse 80% 50% at 10% -10%, rgba(56, 189, 248, 0.12), transparent 50%),
+    radial-gradient(ellipse 60% 40% at 100% 0%, rgba(4, 57, 39, 0.5), transparent 45%),
+    linear-gradient(145deg, #032f20 0%, #043927 45%, #055238 78%, #0d9488 100%);
+}
+
+.app-shell::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  opacity: 0.35;
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
+  background-size: 48px 48px;
+}
+
+.main-pane {
+  position: relative;
+  z-index: 1;
+}
+
+.view-enter {
+  animation: fadeUp 0.4s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.glass-card {
+  background: #ffffff;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  border: 1px solid rgba(226, 232, 240, 0.95);
+  box-shadow:
+    0 1px 2px rgba(15, 23, 42, 0.04),
+    0 8px 24px rgba(15, 23, 42, 0.06);
+  transition:
+    transform 0.25s ease,
+    box-shadow 0.25s ease,
+    border-color 0.25s ease;
+}
+
+.nav-item-anim {
+  transition:
+    background-color 0.25s ease,
+    color 0.25s ease,
+    transform 0.2s ease;
+}
+
+.nav-item-anim:hover {
+  transform: translateX(2px);
+}
+
+.mode-btn-anim {
+  transition:
+    background-color 0.25s ease,
+    color 0.25s ease,
+    transform 0.2s ease,
+    box-shadow 0.25s ease;
+}
+
+.icon-pop {
+  transition: transform 0.25s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.group:hover .icon-pop,
+button:hover .icon-pop {
+  transform: scale(1.08);
+}
+
+.page-title {
+  font-family: var(--font-display), var(--font-sans), system-ui, sans-serif;
+  letter-spacing: -0.03em;
+}
+
+#reader video {
+  object-fit: cover !important;
+}
+
+.print-only {
+  display: none;
+}
+
+@media print {
+  @page {
+    size: A4;
+    margin: 10mm;
+  }
+
+  html,
+  body {
+    height: auto !important;
+    overflow: visible !important;
+    background: white !important;
+    margin: 0 !important;
+    padding: 0 !important;
+  }
+
+  /* Hide the live UI; only the portaled #printArea remains in the print layout */
+  body > *:not(#printArea) {
+    display: none !important;
+  }
+
+  #printArea {
+    display: block !important;
+    position: static !important;
+    width: 100% !important;
+    height: auto !important;
+    overflow: visible !important;
+    background: white !important;
+    color: black !important;
+  }
+
+  .print-grid {
+    display: grid !important;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+    width: 100%;
+    max-width: none;
+    margin: 0;
+    padding: 0;
+  }
+
+  .id-card {
+    border: 2px solid #1e293b;
+    border-radius: 10px;
+    padding: 12px;
+    text-align: center;
+    break-inside: avoid;
+    page-break-inside: avoid;
+    background: white;
+    color: black;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 220px;
+  }
+
+  .id-card h3,
+  .id-card div {
+    color: black !important;
+  }
 }
