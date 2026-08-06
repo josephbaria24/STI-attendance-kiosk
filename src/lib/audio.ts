@@ -85,10 +85,10 @@ export function playAudioNotif(
       msg = "Time out success";
       break;
     case "class":
-      msg = "Class attendance success";
+      msg = isLate ? "Late class attendance" : "Class attendance success";
       break;
     case "event":
-      msg = "Event attendance success";
+      msg = isLate ? "Late event attendance" : "Event attendance success";
       break;
     case "library":
       msg = "Library attendance success";

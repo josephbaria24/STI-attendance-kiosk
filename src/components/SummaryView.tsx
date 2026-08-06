@@ -2,9 +2,31 @@
 
 import { useMemo, useState } from "react";
 import * as XLSX from "xlsx";
+import ExcelJS from "exceljs";
 import { useAttendance } from "@/context/AttendanceContext";
-import { formatDisplayTime, getTodayStr, memberDetails } from "@/lib/utils";
-import type { AttendanceStatus, DayRecord, EventCategory } from "@/lib/types";
+import { useAuth } from "@/context/AuthContext";
+import {
+  formatDisplayTime,
+  getTodayStr,
+  memberDetails,
+  countSessionAttendance,
+  formatDurationSeconds,
+  formatMonthDay,
+  weekdayShort,
+  getAttendanceDateSpan,
+  enumerateDatesInclusive,
+  dayHasCampusAttendance,
+  getTargetCutoffs,
+  ATTENDANCE_LETTER,
+  ATTENDANCE_POINTS,
+} from "@/lib/utils";
+import type {
+  AttendanceStatus,
+  DayRecord,
+  EventCategory,
+  SessionAttendance,
+  SummaryView as SummaryViewId,
+} from "@/lib/types";
 import { categoryLabel, classLabel } from "@/lib/types";
 import {
   Badge,
@@ -19,6 +41,18 @@ import {
 } from "./ui";
 import { HugeIcon } from "./icons";
 
+const SUMMARY_TABS: {
+  id: SummaryViewId;
+  perm: string;
+  label: string;
+  icon: "summary" | "classMode" | "event" | "book";
+}[] = [
+  { id: "general", perm: "summary.general", label: "Daily Gate Roster", icon: "summary" },
+  { id: "class", perm: "summary.class", label: "Classroom Subject Log", icon: "classMode" },
+  { id: "event", perm: "summary.event", label: "Events & Venues Log", icon: "event" },
+  { id: "library", perm: "summary.library", label: "School Library Log", icon: "book" },
+];
+
 export function SummaryView() {
   const {
     db,
@@ -27,6 +61,18 @@ export function SummaryView() {
     openStatusModal,
     showToast,
   } = useAttendance();
+  const { can } = useAuth();
+
+  const allowedTabs = useMemo(
+    () => SUMMARY_TABS.filter((t) => can(t.perm)),
+    [can],
+  );
+  const activeSummaryView =
+    allowedTabs.find((t) => t.id === summaryView)?.id ??
+    allowedTabs[0]?.id ??
+    null;
+  const canExport = can("summary.export");
+  const canOverride = can("summary.statusOverride");
 
   const [dateStr, setDateStr] = useState(getTodayStr());
   const [search, setSearch] = useState("");
@@ -34,6 +80,8 @@ export function SummaryView() {
   const [subjectFilter, setSubjectFilter] = useState("all");
   const [eventFilter, setEventFilter] = useState("all");
   const [exportName, setExportName] = useState("");
+  const [classExportFrom, setClassExportFrom] = useState(getTodayStr);
+  const [classExportTo, setClassExportTo] = useState(getTodayStr);
 
   const dailyData = db.logs[dateStr] || {};
   const q = search.toLowerCase().trim();
@@ -78,6 +126,16 @@ export function SummaryView() {
       }))
       .sort((a, b) => a.label.localeCompare(b.label));
   }, [dailyData, eventMap]);
+
+  function guardExport() {
+    if (canExport) return true;
+    showToast(
+      "Export Denied",
+      "Your account cannot export spreadsheets.",
+      "warning",
+    );
+    return false;
+  }
 
   const counts = useMemo(() => {
     const c = { present: 0, late: 0, excused: 0, absent: 0 };
@@ -264,6 +322,12 @@ export function SummaryView() {
       student: (typeof db.students)[0];
       timeIn: string;
       timeOut: string;
+      durationStr: string;
+      visits: number;
+      ins: number;
+      outs: number;
+      stampLog: string;
+      openVisit: boolean;
     }[] = [];
 
     Object.keys(dailyData).forEach((studentId) => {
@@ -279,11 +343,34 @@ export function SummaryView() {
         !student.id.toLowerCase().includes(q)
       )
         return;
+      const counted = countSessionAttendance(session);
+      const { durationStr } = formatDurationSeconds(counted.seconds);
+      const last = session.scans?.[session.scans.length - 1];
+      const stampLog =
+        session.scans && session.scans.length > 0
+          ? session.scans
+              .map(
+                (s) =>
+                  `${s.type === "out" ? "OUT" : "IN"} ${fmt(s.time)}`
+              )
+              .join(" · ")
+          : [
+              session.timeIn ? `IN ${fmt(session.timeIn)}` : "",
+              session.timeOut ? `OUT ${fmt(session.timeOut)}` : "",
+            ]
+              .filter(Boolean)
+              .join(" · ");
       structured.push({
         studentId,
         student,
         timeIn: session.timeIn || "—",
         timeOut: session.timeOut || "—",
+        durationStr,
+        visits: counted.visits,
+        ins: counted.ins,
+        outs: counted.outs,
+        stampLog: stampLog || "—",
+        openVisit: Boolean(last && last.type === "in"),
       });
     });
 
@@ -298,33 +385,204 @@ export function SummaryView() {
     });
 
     return structured;
-  }, [dailyData, db.students, q, sort]);
+  }, [dailyData, db.students, q, sort, timeFormat]);
 
-  function exportSummary() {
+  const libraryDayStats = useMemo(() => {
+    let totalSeconds = 0;
+    let completedVisits = 0;
+    let currentlyIn = 0;
+    for (const row of libraryRows) {
+      const session = dailyData[row.studentId]?.library;
+      if (!session) continue;
+      const counted = countSessionAttendance(session);
+      totalSeconds += counted.seconds;
+      completedVisits += counted.visits;
+      if (row.openVisit) currentlyIn++;
+    }
+    return {
+      visitors: libraryRows.length,
+      completedVisits,
+      currentlyIn,
+      ...formatDurationSeconds(totalSeconds),
+    };
+  }, [dailyData, libraryRows]);
+
+  async function exportSummary() {
+    if (!guardExport()) return;
     if (db.students.length === 0) return alert("No database elements available.");
     let customFileName = exportName.trim() || `Attendance_Report_${dateStr}`;
     if (!customFileName.endsWith(".xlsx")) customFileName += ".xlsx";
 
-    const exportArr = db.students.map((s) => {
+    const { dates } = getAttendanceDateSpan(db.logs, db.settings, dateStr);
+    const classDaySet = new Set(
+      dates.filter((d) => dayHasCampusAttendance(db.logs[d])),
+    );
+    const classDayCount = classDaySet.size;
+
+    const baseHeaders = [
+      "Member ID",
+      "Name",
+      "Role",
+      "Distinction",
+      "Details / Class",
+      "Time In",
+      "Time Out",
+      "Classes Tracked",
+      "Status",
+    ];
+    const scoreHeaders = ["Points", "Possible", "Score %"];
+    const attendanceStart = baseHeaders.length + 1; // 1-based excel col
+    const attendanceEnd = dates.length
+      ? attendanceStart + dates.length - 1
+      : attendanceStart - 1;
+    const pointsStart = dates.length
+      ? attendanceEnd + 1
+      : baseHeaders.length + 1;
+    const headerRows = 4; // ATTENDANCE / # / weekday / MM/DD
+
+    const thin: ExcelJS.Border = {
+      style: "thin",
+      color: { argb: "FF000000" },
+    };
+    const borderAll: Partial<ExcelJS.Borders> = {
+      top: thin,
+      left: thin,
+      bottom: thin,
+      right: thin,
+    };
+    const center: Partial<ExcelJS.Alignment> = {
+      horizontal: "center",
+      vertical: "middle",
+      wrapText: true,
+    };
+    const statusFill: Record<string, string> = {
+      P: "FFC6EFCE",
+      L: "FFFFEB9C",
+      E: "FFBDD7EE",
+      A: "FFFFC7CE",
+    };
+
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet("Daily Logs", {
+      views: [{ state: "frozen", xSplit: baseHeaders.length, ySplit: headerRows }],
+    });
+
+    // Row 1: base titles + ATTENDANCE + score titles
+    const row1 = ws.getRow(1);
+    baseHeaders.forEach((h, i) => {
+      const cell = row1.getCell(i + 1);
+      cell.value = h;
+      cell.font = { bold: true, size: 10 };
+      cell.alignment = center;
+      cell.border = borderAll;
+    });
+    if (dates.length > 0) {
+      const cell = row1.getCell(attendanceStart);
+      cell.value = "ATTENDANCE";
+      cell.font = { bold: true, size: 12 };
+      cell.alignment = center;
+      cell.border = borderAll;
+      if (dates.length > 1) {
+        ws.mergeCells(1, attendanceStart, 1, attendanceEnd);
+      }
+      for (let c = attendanceStart; c <= attendanceEnd; c++) {
+        row1.getCell(c).border = borderAll;
+        row1.getCell(c).alignment = center;
+        row1.getCell(c).font = { bold: true, size: 12 };
+      }
+    }
+    scoreHeaders.forEach((h, i) => {
+      const cell = row1.getCell(pointsStart + i);
+      cell.value = h;
+      cell.font = { bold: true, size: 10 };
+      cell.alignment = center;
+      cell.border = borderAll;
+    });
+
+    // Rows 2–4: day index / weekday / MM/DD under ATTENDANCE
+    const row2 = ws.getRow(2);
+    const row3 = ws.getRow(3);
+    const row4 = ws.getRow(4);
+    dates.forEach((d, i) => {
+      const col = attendanceStart + i;
+      const c2 = row2.getCell(col);
+      c2.value = i + 1;
+      c2.font = { bold: true, size: 9 };
+      c2.alignment = center;
+      c2.border = borderAll;
+
+      const c3 = row3.getCell(col);
+      c3.value = weekdayShort(d);
+      c3.font = { bold: true, size: 9 };
+      c3.alignment = center;
+      c3.border = borderAll;
+
+      const c4 = row4.getCell(col);
+      c4.value = formatMonthDay(d);
+      c4.font = { bold: true, size: 9 };
+      c4.alignment = center;
+      c4.border = borderAll;
+    });
+
+    // Merge identity + score headers across the 4 header rows
+    baseHeaders.forEach((_, i) => {
+      ws.mergeCells(1, i + 1, headerRows, i + 1);
+      for (let r = 1; r <= headerRows; r++) {
+        const cell = ws.getRow(r).getCell(i + 1);
+        cell.border = borderAll;
+        cell.alignment = center;
+        cell.font = { bold: true, size: 10 };
+      }
+    });
+    scoreHeaders.forEach((_, i) => {
+      const col = pointsStart + i;
+      ws.mergeCells(1, col, headerRows, col);
+      for (let r = 1; r <= headerRows; r++) {
+        const cell = ws.getRow(r).getCell(col);
+        cell.border = borderAll;
+        cell.alignment = center;
+        cell.font = { bold: true, size: 10 };
+      }
+    });
+
+    // Thick line under header block
+    for (let c = 1; c <= pointsStart + scoreHeaders.length - 1; c++) {
+      const cell = row4.getCell(c);
+      cell.border = {
+        ...borderAll,
+        bottom: { style: "medium", color: { argb: "FF1E293B" } },
+      };
+    }
+
+    db.students.forEach((s) => {
       const r = dailyData[s.id] || {
         timeIn: "—",
         timeOut: "—",
-        status: "Absent",
+        status: "Absent" as AttendanceStatus,
         classes: {},
       };
-      return {
-        Date: dateStr,
-        "Member ID": s.id,
-        Name: s.name,
-        Role: s.role ? s.role.toUpperCase() : "STUDENT",
-        Distinction: s.distinction || "—",
-        "Details / Class":
-          s.role === "faculty" || s.role === "admin"
-            ? s.dept
-            : `${s.grade} - ${s.section}`,
-        "Time In": fmt(r.timeIn || "—"),
-        "Time Out": fmt(r.timeOut || "—"),
-        "Classes Tracked": r.classes
+      let points = 0;
+      const letters = dates.map((d) => {
+        if (!classDaySet.has(d)) return "";
+        const status: AttendanceStatus = db.logs[d]?.[s.id]?.status || "Absent";
+        points += ATTENDANCE_POINTS[status];
+        return ATTENDANCE_LETTER[status];
+      });
+      const possible = classDayCount * ATTENDANCE_POINTS.Present;
+      const scorePct =
+        possible > 0 ? Math.round((points / possible) * 1000) / 10 : 0;
+
+      const row = ws.addRow([
+        s.id,
+        s.name,
+        s.role ? s.role.toUpperCase() : "STUDENT",
+        s.distinction || "—",
+        s.role === "faculty" || s.role === "admin"
+          ? s.dept
+          : `${s.grade} - ${s.section}`,
+        fmt(r.timeIn || "—"),
+        fmt(r.timeOut || "—"),
+        r.classes
           ? Object.keys(r.classes)
               .map((id) => {
                 const cls = classMap.get(id);
@@ -332,53 +590,410 @@ export function SummaryView() {
               })
               .join(", ")
           : "—",
-        Status: r.status,
-      };
+        r.status,
+        ...letters,
+        points,
+        possible,
+        scorePct,
+      ]);
+
+      row.eachCell({ includeEmpty: true }, (cell, colNumber) => {
+        cell.border = borderAll;
+        cell.alignment = center;
+        if (
+          dates.length > 0 &&
+          colNumber >= attendanceStart &&
+          colNumber <= attendanceEnd
+        ) {
+          const letter = String(cell.value || "");
+          if (letter && statusFill[letter]) {
+            cell.fill = {
+              type: "pattern",
+              pattern: "solid",
+              fgColor: { argb: statusFill[letter] },
+            };
+            cell.font = { bold: true, size: 10 };
+          }
+        }
+      });
     });
 
-    const ws = XLSX.utils.json_to_sheet(exportArr);
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "Daily Logs");
-    XLSX.writeFile(wb, customFileName);
-    showToast("Export Dispatched", `Saved file as: ${customFileName}`, "success");
+    baseHeaders.forEach((_, i) => {
+      ws.getColumn(i + 1).width = i === 1 ? 22 : i === 4 ? 18 : 12;
+    });
+    dates.forEach((_, i) => {
+      ws.getColumn(attendanceStart + i).width = 5;
+    });
+    scoreHeaders.forEach((_, i) => {
+      ws.getColumn(pointsStart + i).width = 10;
+    });
+
+    const key = wb.addWorksheet("Attendance Key");
+    key.addRows([
+      ["Code", "Meaning", "Points"],
+      ["P", "Present", ATTENDANCE_POINTS.Present],
+      ["L", "Late", ATTENDANCE_POINTS.Late],
+      ["E", "Excuse", ATTENDANCE_POINTS.Excused],
+      ["A", "Absent", ATTENDANCE_POINTS.Absent],
+      [],
+      ["Blank cell", "No class that day (nobody scanned on campus)."],
+      [
+        "Scope",
+        db.settings.termStartDate
+          ? "Full term calendar (day # / weekday / date)."
+          : "Calendar from first to last log date.",
+      ],
+    ]);
+
+    const buffer = await wb.xlsx.writeBuffer();
+    const blob = new Blob([buffer], {
+      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = customFileName;
+    a.click();
+    URL.revokeObjectURL(url);
+
+    showToast(
+      "Export Dispatched",
+      dates.length
+        ? `Saved ${customFileName} with ${dates.length} day columns (${classDayCount} class day(s)).`
+        : `Saved ${customFileName}.`,
+      "success",
+    );
   }
 
-  function exportClassLogs() {
-    const dataset: Record<string, string>[] = [];
-    Object.keys(dailyData).forEach((studentId) => {
-      const record = dailyData[studentId];
-      const student = db.students.find((s) => String(s.id) === String(studentId));
-      if (!student || !record.classes) return;
-      Object.keys(record.classes).forEach((classKey) => {
-        const subjectName = resolveClassLabel(classKey);
-        if (subjectFilter !== "all" && subjectName !== subjectFilter) return;
-        const session = record.classes[classKey];
-        dataset.push({
-          "Log Date": dateStr,
-          "Student ID": student.id,
-          "Full Name": student.name,
-          Distinction: student.distinction,
-          "Class Structure": `${student.grade} - ${student.section}`,
-          "Subject / Course": subjectName,
-          "Time In": fmt(session.timeIn || "—"),
-          "Time Out": fmt(session.timeOut || "—"),
+  async function exportClassLogs() {
+    if (!guardExport()) return;
+    const from =
+      classExportFrom <= classExportTo ? classExportFrom : classExportTo;
+    const to =
+      classExportFrom <= classExportTo ? classExportTo : classExportFrom;
+    const dates = enumerateDatesInclusive(from, to);
+    if (dates.length === 0) return alert("Invalid date range.");
+
+    const subjectsInRange = new Set<string>();
+    dates.forEach((d) => {
+      Object.values(db.logs[d] || {}).forEach((record) => {
+        Object.keys(record.classes || {}).forEach((classKey) => {
+          subjectsInRange.add(resolveClassLabel(classKey));
         });
       });
     });
-    if (dataset.length === 0) return alert("No classroom entries found to extract.");
-    const ws = XLSX.utils.json_to_sheet(dataset);
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "Classroom Tracking");
-    const filename = `Class_Attendance_Report_${dateStr}.xlsx`;
-    XLSX.writeFile(wb, filename);
+
+    const subjectsToExport =
+      subjectFilter === "all"
+        ? Array.from(subjectsInRange).sort()
+        : subjectsInRange.has(subjectFilter)
+          ? [subjectFilter]
+          : [];
+
+    if (subjectsToExport.length === 0) {
+      return alert(
+        subjectFilter === "all"
+          ? "No classroom entries found in that date range."
+          : `No entries for "${subjectFilter}" in that date range.`,
+      );
+    }
+
+    const lateTime = getTargetCutoffs(db.settings, "class").lateTime;
+    const thin: ExcelJS.Border = {
+      style: "thin",
+      color: { argb: "FF000000" },
+    };
+    const borderAll: Partial<ExcelJS.Borders> = {
+      top: thin,
+      left: thin,
+      bottom: thin,
+      right: thin,
+    };
+    const center: Partial<ExcelJS.Alignment> = {
+      horizontal: "center",
+      vertical: "middle",
+      wrapText: true,
+    };
+    const statusFill: Record<string, string> = {
+      P: "FFC6EFCE",
+      L: "FFFFEB9C",
+      E: "FFBDD7EE",
+      A: "FFFFC7CE",
+    };
+
+    function subjectSession(
+      record: DayRecord | undefined,
+      subjectName: string,
+    ): SessionAttendance | undefined {
+      if (!record?.classes) return undefined;
+      const matches = Object.entries(record.classes).filter(
+        ([key]) => resolveClassLabel(key) === subjectName,
+      );
+      if (matches.length === 0) return undefined;
+      return (
+        matches.find(
+          ([, s]) => s.timeIn || (s.scans && s.scans.length > 0),
+        )?.[1] || matches[0][1]
+      );
+    }
+
+    function dayHasSubjectClass(
+      dayLogs: Record<string, DayRecord> | undefined,
+      subjectName: string,
+    ): boolean {
+      if (!dayLogs) return false;
+      return Object.values(dayLogs).some((record) => {
+        const session = subjectSession(record, subjectName);
+        return Boolean(
+          session?.timeIn ||
+            session?.timeOut ||
+            (session?.scans && session.scans.length > 0),
+        );
+      });
+    }
+
+    function letterForClassDay(
+      record: DayRecord | undefined,
+      subjectName: string,
+    ): "P" | "A" | "L" | "E" {
+      if (record?.status === "Excused") return "E";
+      const session = subjectSession(record, subjectName);
+      const timeIn =
+        session?.timeIn ||
+        session?.scans?.find((s) => s.type === "in")?.time ||
+        "";
+      if (!timeIn || timeIn === "—") return "A";
+      const normalized =
+        timeIn.length === 5 ? `${timeIn}:00` : timeIn;
+      if (normalized > `${lateTime}:00`) return "L";
+      return "P";
+    }
+
+    const wb = new ExcelJS.Workbook();
+    const baseHeaders = ["#", "STUDENT NO.", "STUDENT NAME"];
+    const scoreHeaders = ["Points", "Possible", "Score %"];
+    const headerRows = 4;
+    const attendanceStart = baseHeaders.length + 1;
+    const attendanceEnd = attendanceStart + dates.length - 1;
+    const pointsStart = attendanceEnd + 1;
+
+    for (const subjectName of subjectsToExport) {
+      const classDaySet = new Set(
+        dates.filter((d) => dayHasSubjectClass(db.logs[d], subjectName)),
+      );
+      const classDayCount = classDaySet.size;
+
+      const sheetName = subjectName.replace(/[\\/*?[\]:]/g, " ").slice(0, 31);
+      const ws = wb.addWorksheet(sheetName || "Class", {
+        views: [
+          {
+            state: "frozen",
+            xSplit: baseHeaders.length,
+            ySplit: headerRows,
+          },
+        ],
+      });
+
+      const row1 = ws.getRow(1);
+      baseHeaders.forEach((h, i) => {
+        const cell = row1.getCell(i + 1);
+        cell.value = h;
+        cell.font = { bold: true, size: 10 };
+        cell.alignment = center;
+        cell.border = borderAll;
+      });
+      {
+        const cell = row1.getCell(attendanceStart);
+        cell.value = "ATTENDANCE";
+        cell.font = { bold: true, size: 12 };
+        cell.alignment = center;
+        if (dates.length > 1) {
+          ws.mergeCells(1, attendanceStart, 1, attendanceEnd);
+        }
+        for (let c = attendanceStart; c <= attendanceEnd; c++) {
+          row1.getCell(c).border = borderAll;
+          row1.getCell(c).alignment = center;
+          row1.getCell(c).font = { bold: true, size: 12 };
+        }
+      }
+      scoreHeaders.forEach((h, i) => {
+        const cell = row1.getCell(pointsStart + i);
+        cell.value = h;
+        cell.font = { bold: true, size: 10 };
+        cell.alignment = center;
+        cell.border = borderAll;
+      });
+
+      const row2 = ws.getRow(2);
+      const row3 = ws.getRow(3);
+      const row4 = ws.getRow(4);
+      dates.forEach((d, i) => {
+        const col = attendanceStart + i;
+        const c2 = row2.getCell(col);
+        c2.value = i + 1;
+        c2.font = { bold: true, size: 9 };
+        c2.alignment = center;
+        c2.border = borderAll;
+
+        const c3 = row3.getCell(col);
+        c3.value = weekdayShort(d);
+        c3.font = { bold: true, size: 9 };
+        c3.alignment = center;
+        c3.border = borderAll;
+
+        const c4 = row4.getCell(col);
+        c4.value = formatMonthDay(d);
+        c4.font = { bold: true, size: 9 };
+        c4.alignment = center;
+        c4.border = borderAll;
+      });
+
+      baseHeaders.forEach((_, i) => {
+        ws.mergeCells(1, i + 1, headerRows, i + 1);
+        for (let r = 1; r <= headerRows; r++) {
+          const cell = ws.getRow(r).getCell(i + 1);
+          cell.border = borderAll;
+          cell.alignment = center;
+          cell.font = { bold: true, size: 10 };
+        }
+      });
+      scoreHeaders.forEach((_, i) => {
+        const col = pointsStart + i;
+        ws.mergeCells(1, col, headerRows, col);
+        for (let r = 1; r <= headerRows; r++) {
+          const cell = ws.getRow(r).getCell(col);
+          cell.border = borderAll;
+          cell.alignment = center;
+          cell.font = { bold: true, size: 10 };
+        }
+      });
+
+      for (let c = 1; c <= pointsStart + scoreHeaders.length - 1; c++) {
+        const cell = row4.getCell(c);
+        cell.border = {
+          ...borderAll,
+          bottom: { style: "medium", color: { argb: "FF1E293B" } },
+        };
+      }
+
+      const scannedIds = new Set<string>();
+      dates.forEach((d) => {
+        Object.entries(db.logs[d] || {}).forEach(([studentId, record]) => {
+          const session = subjectSession(record, subjectName);
+          if (
+            session?.timeIn ||
+            session?.timeOut ||
+            (session?.scans && session.scans.length > 0)
+          ) {
+            scannedIds.add(studentId);
+          }
+        });
+      });
+
+      const roster = db.students
+        .filter((s) => scannedIds.has(s.id) || scannedIds.has(String(s.id)))
+        .sort((a, b) => a.name.localeCompare(b.name));
+
+      if (roster.length === 0) continue;
+
+      roster.forEach((student, index) => {
+        let points = 0;
+        const letters = dates.map((d) => {
+          if (!classDaySet.has(d)) return "";
+          const letter = letterForClassDay(db.logs[d]?.[student.id], subjectName);
+          const status: AttendanceStatus =
+            letter === "P"
+              ? "Present"
+              : letter === "L"
+                ? "Late"
+                : letter === "E"
+                  ? "Excused"
+                  : "Absent";
+          points += ATTENDANCE_POINTS[status];
+          return letter;
+        });
+        const possible = classDayCount * ATTENDANCE_POINTS.Present;
+        const scorePct =
+          possible > 0 ? Math.round((points / possible) * 1000) / 10 : 0;
+
+        const row = ws.addRow([
+          index + 1,
+          student.id,
+          student.name,
+          ...letters,
+          points,
+          possible,
+          scorePct,
+        ]);
+
+        row.eachCell({ includeEmpty: true }, (cell, colNumber) => {
+          cell.border = borderAll;
+          cell.alignment = center;
+          if (colNumber === 3) {
+            cell.alignment = { horizontal: "left", vertical: "middle" };
+          }
+          if (colNumber >= attendanceStart && colNumber <= attendanceEnd) {
+            const letter = String(cell.value || "");
+            if (letter && statusFill[letter]) {
+              cell.fill = {
+                type: "pattern",
+                pattern: "solid",
+                fgColor: { argb: statusFill[letter] },
+              };
+              cell.font = { bold: true, size: 10 };
+            }
+          }
+        });
+      });
+
+      ws.getColumn(1).width = 5;
+      ws.getColumn(2).width = 14;
+      ws.getColumn(3).width = 28;
+      dates.forEach((_, i) => {
+        ws.getColumn(attendanceStart + i).width = 5;
+      });
+      scoreHeaders.forEach((_, i) => {
+        ws.getColumn(pointsStart + i).width = 10;
+      });
+    }
+
+    const key = wb.addWorksheet("Attendance Key");
+    key.addRows([
+      ["Code", "Meaning", "Points"],
+      ["P", "Present", ATTENDANCE_POINTS.Present],
+      ["L", "Late (after class cutoff)", ATTENDANCE_POINTS.Late],
+      ["E", "Excuse", ATTENDANCE_POINTS.Excused],
+      ["A", "Absent", ATTENDANCE_POINTS.Absent],
+      [],
+      ["Blank cell", "No class that day (nobody scanned into the subject)."],
+      ["Range", `${from} → ${to}`],
+    ]);
+
+    const filename =
+      from === to
+        ? `Class_Attendance_Report_${from}.xlsx`
+        : `Class_Attendance_Report_${from}_to_${to}.xlsx`;
+
+    const buffer = await wb.xlsx.writeBuffer();
+    const blob = new Blob([buffer], {
+      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+
     showToast(
       "Class Log Exported",
-      `Extracted dataset successfully as ${filename}`,
-      "success"
+      `${subjectsToExport.length} subject sheet(s) · ${dates.length} day columns`,
+      "success",
     );
   }
 
   function exportEventLogs() {
+    if (!guardExport()) return;
     const dataset: Record<string, string>[] = [];
     Object.keys(dailyData).forEach((studentId) => {
       const record = dailyData[studentId];
@@ -415,15 +1030,22 @@ export function SummaryView() {
   }
 
   function exportLibraryLogs() {
-    const dataset: Record<string, string>[] = libraryRows.map((row) => ({
+    if (!guardExport()) return;
+    const dataset: Record<string, string | number>[] = libraryRows.map((row) => ({
       "Log Date": dateStr,
       "Student ID": row.student.id,
       "Full Name": row.student.name,
       Distinction: row.student.distinction || "—",
       "Class / Dept": memberDetails(row.student),
       Venue: "School Library",
-      "Time In": fmt(row.timeIn),
-      "Time Out": fmt(row.timeOut),
+      "Latest Time In": fmt(row.timeIn),
+      "Latest Time Out": row.openVisit ? "Still in library" : fmt(row.timeOut),
+      "Time In Stamps": row.ins,
+      "Time Out Stamps": row.outs,
+      "Completed Visits": row.visits,
+      "All Timestamps": row.stampLog,
+      "Hours Logged (day)": row.durationStr,
+      Status: row.openVisit ? "In library" : "Completed",
     }));
     if (dataset.length === 0)
       return alert("No school library entries found to extract.");
@@ -443,40 +1065,31 @@ export function SummaryView() {
     <section>
       <PageHeader
         title="Attendance Summary"
-        subtitle="Gate roster, classroom logs, and event / venue check-ins"
+        subtitle="Gate roster, classroom logs, events, and school library visit hours"
         icon={<HugeIcon name="summary" size={22} />}
       />
 
       <div className="mb-5 flex flex-wrap gap-2.5">
-        <Button
-          variant={summaryView === "general" ? "primary" : "secondary"}
-          onClick={() => setSummaryView("general")}
-        >
-          <HugeIcon name="summary" size={16} className="icon-pop" />
-          Daily Gate Roster
-        </Button>
-        <Button
-          variant={summaryView === "class" ? "primary" : "secondary"}
-          onClick={() => setSummaryView("class")}
-        >
-          <HugeIcon name="classMode" size={16} className="icon-pop" />
-          Classroom Subject Log
-        </Button>
-        <Button
-          variant={summaryView === "event" ? "primary" : "secondary"}
-          onClick={() => setSummaryView("event")}
-        >
-          <HugeIcon name="event" size={16} className="icon-pop" />
-          Events & Venues Log
-        </Button>
-        <Button
-          variant={summaryView === "library" ? "primary" : "secondary"}
-          onClick={() => setSummaryView("library")}
-        >
-          <HugeIcon name="book" size={16} className="icon-pop" />
-          School Library Log
-        </Button>
+        {allowedTabs.map((tab) => (
+          <Button
+            key={tab.id}
+            variant={activeSummaryView === tab.id ? "primary" : "secondary"}
+            onClick={() => setSummaryView(tab.id)}
+          >
+            <HugeIcon name={tab.icon} size={16} className="icon-pop" />
+            {tab.label}
+          </Button>
+        ))}
       </div>
+
+      {!activeSummaryView ? (
+        <Card>
+          <p className="text-sm text-slate-500">
+            No summary logs are enabled for your account.
+          </p>
+        </Card>
+      ) : (
+      <>
 
       <Card className="flex flex-wrap gap-4 pb-4">
         <Field label="Select Date Record" className="mb-0 max-w-[180px]">
@@ -487,7 +1100,7 @@ export function SummaryView() {
             onChange={(e) => setDateStr(e.target.value)}
           />
         </Field>
-        {summaryView === "class" && (
+        {activeSummaryView === "class" && (
           <Field label="Filter By Subject" className="mb-0 max-w-[200px]">
             <select
               className={inputClass}
@@ -503,7 +1116,7 @@ export function SummaryView() {
             </select>
           </Field>
         )}
-        {summaryView === "event" && (
+        {activeSummaryView === "event" && (
           <Field label="Filter By Event" className="mb-0 max-w-[220px]">
             <select
               className={inputClass}
@@ -542,14 +1155,14 @@ export function SummaryView() {
         </Field>
       </Card>
 
-      {summaryView === "general" ? (
+      {activeSummaryView === "general" ? (
         <div className="mb-6 grid gap-6 sm:grid-cols-2 lg:grid-cols-4">
           <StatCard label="Total Present" value={counts.present} />
           <StatCard label="Total Late" value={counts.late} />
           <StatCard label="Total Excused" value={counts.excused} />
           <StatCard label="Absent / No Scan" value={counts.absent} />
         </div>
-      ) : summaryView === "class" ? (
+      ) : activeSummaryView === "class" ? (
         <div className="mb-6 grid gap-6 md:grid-cols-2">
           <StatCard
             label="Total Attending Students"
@@ -560,13 +1173,24 @@ export function SummaryView() {
             value={classRows.totalSubjects}
           />
         </div>
-      ) : summaryView === "library" ? (
-        <div className="mb-6 grid gap-6 md:grid-cols-2">
+      ) : activeSummaryView === "library" ? (
+        <div className="mb-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
           <StatCard
             label="Library Visitors (unique)"
-            value={libraryRows.length}
+            value={libraryDayStats.visitors}
           />
-          <StatCard label="Venue" value="School Library" />
+          <StatCard
+            label="Completed Visits"
+            value={libraryDayStats.completedVisits}
+          />
+          <StatCard
+            label="Currently In Library"
+            value={libraryDayStats.currentlyIn}
+          />
+          <StatCard
+            label="Hours Logged Today"
+            value={libraryDayStats.durationStr}
+          />
         </div>
       ) : (
         <div className="mb-6 grid gap-6 md:grid-cols-2">
@@ -581,11 +1205,13 @@ export function SummaryView() {
         </div>
       )}
 
-      {summaryView === "general" ? (
+      {activeSummaryView === "general" ? (
         <Card>
           <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
             <SectionTitle>Daily Gate Record Sheet</SectionTitle>
             <div className="flex flex-wrap items-center gap-2.5">
+              {canExport && (
+                <>
               <input
                 className={`${inputClass} w-[220px] py-2 text-[13px]`}
                 placeholder="Custom filename (optional)"
@@ -596,6 +1222,8 @@ export function SummaryView() {
                 <HugeIcon name="download" size={16} className="icon-pop" />
                 Export Daily
               </Button>
+                </>
+              )}
             </div>
           </div>
           <TableShell>
@@ -610,7 +1238,7 @@ export function SummaryView() {
                   "Time Out",
                   "Tracked Classes",
                   "Status",
-                  "Admin Actions",
+                  ...(canOverride ? ["Admin Actions"] : []),
                 ].map((h) => (
                   <th
                     key={h}
@@ -676,6 +1304,7 @@ export function SummaryView() {
                         {record.status}
                       </Badge>
                     </td>
+                    {canOverride && (
                     <td className="border-b border-slate-200 px-4 py-3">
                       <Button
                         variant="secondary"
@@ -692,20 +1321,43 @@ export function SummaryView() {
                         Edit Status
                       </Button>
                     </td>
+                    )}
                   </tr>
                 ))
               )}
             </tbody>
           </TableShell>
         </Card>
-      ) : summaryView === "class" ? (
+      ) : activeSummaryView === "class" ? (
         <Card>
           <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
             <SectionTitle>Classroom Subject Attendance Sheet</SectionTitle>
-            <Button variant="teal" onClick={exportClassLogs}>
-              <HugeIcon name="download" size={16} className="icon-pop" />
-              Export Class Logs
-            </Button>
+            {canExport && (
+              <div className="flex flex-wrap items-end gap-2.5">
+                <Field label="From" className="mb-0 max-w-[150px]">
+                  <input
+                    type="date"
+                    className={inputClass}
+                    value={classExportFrom}
+                    max={classExportTo || undefined}
+                    onChange={(e) => setClassExportFrom(e.target.value)}
+                  />
+                </Field>
+                <Field label="To" className="mb-0 max-w-[150px]">
+                  <input
+                    type="date"
+                    className={inputClass}
+                    value={classExportTo}
+                    min={classExportFrom || undefined}
+                    onChange={(e) => setClassExportTo(e.target.value)}
+                  />
+                </Field>
+                <Button variant="teal" onClick={exportClassLogs}>
+                  <HugeIcon name="download" size={16} className="icon-pop" />
+                  Export Class Logs
+                </Button>
+              </div>
+            )}
           </div>
           <TableShell>
             <thead>
@@ -771,15 +1423,21 @@ export function SummaryView() {
             </tbody>
           </TableShell>
         </Card>
-      ) : summaryView === "library" ? (
+      ) : activeSummaryView === "library" ? (
         <Card>
           <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
             <SectionTitle>School Library Attendance Sheet</SectionTitle>
+            {canExport && (
             <Button variant="secondary" onClick={exportLibraryLogs}>
               <HugeIcon name="download" size={16} className="icon-pop" />
               Export Library Logs
             </Button>
+            )}
           </div>
+          <p className="mb-3 text-[12px] text-slate-500">
+            Auto In / Out visits for this date. Duration counts completed
+            In→Out pairs (students need 3 hours per term — see Analytics).
+          </p>
           <TableShell>
             <thead>
               <tr>
@@ -791,6 +1449,10 @@ export function SummaryView() {
                   "Venue",
                   "Time In",
                   "Time Out",
+                  "In Stamps",
+                  "Out Stamps",
+                  "Visits",
+                  "Hours (day)",
                 ].map((h) => (
                   <th
                     key={h}
@@ -805,7 +1467,7 @@ export function SummaryView() {
               {libraryRows.length === 0 ? (
                 <tr>
                   <td
-                    colSpan={7}
+                    colSpan={11}
                     className="px-4 py-6 text-center text-slate-500"
                   >
                     No school library visits found for this date.
@@ -833,7 +1495,25 @@ export function SummaryView() {
                       {fmt(row.timeIn)}
                     </td>
                     <td className="border-b border-slate-200 px-4 py-3 text-sm font-semibold">
-                      {fmt(row.timeOut)}
+                      {row.openVisit ? (
+                        <span className="rounded-md bg-indigo-50 px-2 py-0.5 text-[11px] font-bold text-indigo-800 ring-1 ring-indigo-200">
+                          Still in
+                        </span>
+                      ) : (
+                        fmt(row.timeOut)
+                      )}
+                    </td>
+                    <td className="border-b border-slate-200 px-4 py-3 text-sm font-semibold">
+                      {row.ins}
+                    </td>
+                    <td className="border-b border-slate-200 px-4 py-3 text-sm font-semibold">
+                      {row.outs}
+                    </td>
+                    <td className="border-b border-slate-200 px-4 py-3 text-sm">
+                      {row.visits}
+                    </td>
+                    <td className="border-b border-slate-200 px-4 py-3 text-sm font-semibold text-[var(--sidebar)]">
+                      {row.durationStr}
                     </td>
                   </tr>
                 ))
@@ -845,10 +1525,12 @@ export function SummaryView() {
         <Card>
           <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
             <SectionTitle>Events & Venues Attendance Sheet</SectionTitle>
+            {canExport && (
             <Button variant="secondary" onClick={exportEventLogs}>
               <HugeIcon name="download" size={16} className="icon-pop" />
               Export Event Logs
             </Button>
+            )}
           </div>
           <TableShell>
             <thead>
@@ -918,6 +1600,8 @@ export function SummaryView() {
             </tbody>
           </TableShell>
         </Card>
+      )}
+      </>
       )}
     </section>
   );

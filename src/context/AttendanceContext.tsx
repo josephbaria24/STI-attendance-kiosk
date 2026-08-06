@@ -11,7 +11,7 @@ import {
   type ReactNode,
 } from "react";
 import { playAudioNotif, resumeAudio } from "@/lib/audio";
-import { DEMO_STUDENTS, formatDisplayTime, formatNowTime, getTodayStr } from "@/lib/utils";
+import { DEMO_STUDENTS, formatDisplayTime, formatNowTime, getTargetCutoffs, getTodayStr } from "@/lib/utils";
 import { isSupabaseConfigured } from "@/lib/supabase/client";
 import {
   createEventRow,
@@ -140,9 +140,39 @@ const AttendanceContext = createContext<AttendanceContextValue | null>(null);
 
 function errMsg(e: unknown) {
   if (e && typeof e === "object" && "message" in e) {
-    return String((e as { message: string }).message);
+    const msg = String((e as { message: string }).message);
+    const code =
+      "code" in e ? String((e as { code?: string }).code || "") : "";
+    if (
+      code === "PGRST205" ||
+      /could not find the table/i.test(msg) ||
+      /schema cache/i.test(msg)
+    ) {
+      if (/library_attendance/i.test(msg)) {
+        return "Missing public.library_attendance. Run supabase/library.sql in the Supabase SQL Editor, then retry.";
+      }
+      if (/event_attendance|public\.events/i.test(msg)) {
+        return "Missing event tables. Run supabase/events.sql in the Supabase SQL Editor, then retry.";
+      }
+      if (/class_attendance|public\.classes/i.test(msg)) {
+        return "Missing class tables. Run supabase/classes.sql in the Supabase SQL Editor, then retry.";
+      }
+      return `${msg} — Apply the matching file from /supabase in the SQL Editor.`;
+    }
+    return msg;
   }
   return String(e);
+}
+
+/** Library re-scan cooldown (prevents accidental double scans). */
+const LIBRARY_RESCAN_MS = 60_000;
+
+function libraryScanTimeToMs(timeStr: string, now: Date): number {
+  const parts = timeStr.trim().split(":").map((p) => Number(p));
+  if (parts.length < 2 || parts.some((n) => !Number.isFinite(n))) return NaN;
+  const d = new Date(now);
+  d.setHours(parts[0], parts[1], parts[2] || 0, 0);
+  return d.getTime();
 }
 
 const UI_STATE_KEY = "attendx_ui_state_v1";
@@ -391,12 +421,37 @@ export function AttendanceProvider({ children }: { children: ReactNode }) {
         applyLocal(next);
         const mode = next.settings.thresholdMode;
         const tf = next.settings.timeFormat || "12h";
-        if (partial.timeFormat && Object.keys(partial).length === 1) {
+        const keys = Object.keys(partial);
+        const termKeys = ["termName", "termStartDate", "termMonths"];
+        const cutoffKeys = [
+          "lateTime",
+          "timeoutTime",
+          "classLateTime",
+          "classTimeoutTime",
+          "eventLateTime",
+          "eventTimeoutTime",
+        ];
+        if (partial.timeFormat && keys.length === 1) {
           showToast(
             "Time Format Updated",
             tf === "12h"
               ? "Using 12-hour clock (AM/PM) across pages and exports."
               : "Using 24-hour clock across pages and exports.",
+            "success"
+          );
+        } else if (keys.every((k) => termKeys.includes(k))) {
+          const name = (next.settings.termName || "").trim() || "Unnamed term";
+          const start = next.settings.termStartDate || "—";
+          const months = next.settings.termMonths ?? 4;
+          showToast(
+            "Term Updated",
+            `${name} · starts ${start} · ${months} month${months === 1 ? "" : "s"}`,
+            "success"
+          );
+        } else if (keys.every((k) => cutoffKeys.includes(k))) {
+          showToast(
+            "Target Cutoffs Saved",
+            "Per-target Time In / Time Out thresholds updated.",
             "success"
           );
         } else {
@@ -524,16 +579,33 @@ export function AttendanceProvider({ children }: { children: ReactNode }) {
             scanType: io,
             scannedAt: timeStr,
           });
+
+          const eventCutoffs = getTargetCutoffs(current.settings, "event");
+          let eventFlag = "";
+          if (isStrict && io === "in" && timeStr > `${eventCutoffs.lateTime}:00`) {
+            eventFlag = "LATE";
+          } else if (
+            isStrict &&
+            io === "out" &&
+            timeStr < `${eventCutoffs.timeoutTime}:00`
+          ) {
+            eventFlag = "EARLY OUT";
+          }
+
           logConsole(
-            `EVENT ${io.toUpperCase()}: ${student.name} → ${eventDef.name}.`
+            eventFlag
+              ? `EVENT ${io.toUpperCase()} (${eventFlag}): ${student.name} → ${eventDef.name}.`
+              : `EVENT ${io.toUpperCase()}: ${student.name} → ${eventDef.name}.`
           );
-          playAudioNotif("event");
+          playAudioNotif("event", eventFlag === "LATE");
           showScanNotification({
             student,
             mode: "event",
             timeStr,
             status: "Present",
-            customHeader: `${eventDef.name.toUpperCase()} · TIME ${io.toUpperCase()}`,
+            customHeader: eventFlag
+              ? `${eventDef.name.toUpperCase()} · TIME ${io.toUpperCase()} · ${eventFlag}`
+              : `${eventDef.name.toUpperCase()} · TIME ${io.toUpperCase()}`,
           });
           logs[today][student.id] = dayRecord;
           applyLocal({ ...current, logs });
@@ -542,35 +614,48 @@ export function AttendanceProvider({ children }: { children: ReactNode }) {
 
         if (effectiveMode === "library") {
           const session = dayRecord.library || emptySessionAttendance();
-          if (isStrict && io === "in" && session.timeIn) {
-            playAudioNotif("duplicate");
-            const overwrite = confirm(
-              `${student.name} already timed IN to School Library at ${tShow(session.timeIn)}. Overwrite?`
-            );
-            if (!overwrite) return;
+          const lastLibScan = session.scans[session.scans.length - 1];
+          if (lastLibScan) {
+            const lastMs = libraryScanTimeToMs(lastLibScan.time, now);
+            const elapsed = now.getTime() - lastMs;
+            if (Number.isFinite(lastMs) && elapsed < LIBRARY_RESCAN_MS) {
+              const waitSec = Math.max(
+                1,
+                Math.ceil((LIBRARY_RESCAN_MS - elapsed) / 1000)
+              );
+              playAudioNotif("duplicate");
+              showToast(
+                "Already Scanned",
+                `${student.name} already scanned for School Library. Please wait ${waitSec}s before scanning again.`,
+                "warning"
+              );
+              logConsole(
+                `LIBRARY cooldown: ${student.name} must wait ${waitSec}s.`
+              );
+              return;
+            }
           }
-          if (isStrict && io === "out" && session.timeOut) {
-            playAudioNotif("duplicate");
-            const overwrite = confirm(
-              `${student.name} already timed OUT of School Library at ${tShow(session.timeOut)}. Overwrite?`
-            );
-            if (!overwrite) return;
-          }
+
+          // Auto In on first / re-entry scan; Auto Out on the next scan after cooldown
+          const libIo: "in" | "out" =
+            !lastLibScan || lastLibScan.type === "out" ? "in" : "out";
+
           const nextSession = {
             ...session,
-            scans: [...session.scans, { type: io, time: timeStr }],
-            timeIn: io === "in" ? timeStr : session.timeIn,
-            timeOut: io === "out" ? timeStr : session.timeOut,
+            scans: [...session.scans, { type: libIo, time: timeStr }],
+            timeIn: libIo === "in" ? timeStr : session.timeIn,
+            // New visit clears previous out; out stamps the current visit
+            timeOut: libIo === "in" ? "" : timeStr,
           };
           dayRecord.library = nextSession;
           await insertLibraryScan({
             logDate: today,
             memberId: student.id,
-            scanType: io,
+            scanType: libIo,
             scannedAt: timeStr,
           });
           logConsole(
-            `LIBRARY ${io.toUpperCase()}: ${student.name} → School Library.`
+            `LIBRARY ${libIo.toUpperCase()}: ${student.name} → School Library.`
           );
           playAudioNotif("library");
           showScanNotification({
@@ -578,7 +663,7 @@ export function AttendanceProvider({ children }: { children: ReactNode }) {
             mode: "library",
             timeStr,
             status: "Present",
-            customHeader: `SCHOOL LIBRARY · TIME ${io.toUpperCase()}`,
+            customHeader: `SCHOOL LIBRARY · TIME ${libIo.toUpperCase()}`,
           });
           logs[today][student.id] = dayRecord;
           applyLocal({ ...current, logs });
@@ -633,16 +718,33 @@ export function AttendanceProvider({ children }: { children: ReactNode }) {
             scanType: io,
             scannedAt: timeStr,
           });
+
+          const classCutoffs = getTargetCutoffs(current.settings, "class");
+          let classFlag = "";
+          if (isStrict && io === "in" && timeStr > `${classCutoffs.lateTime}:00`) {
+            classFlag = "LATE";
+          } else if (
+            isStrict &&
+            io === "out" &&
+            timeStr < `${classCutoffs.timeoutTime}:00`
+          ) {
+            classFlag = "EARLY OUT";
+          }
+
           logConsole(
-            `CLASS ${io.toUpperCase()}: ${student.name} → ${subjectLabel}.`
+            classFlag
+              ? `CLASS ${io.toUpperCase()} (${classFlag}): ${student.name} → ${subjectLabel}.`
+              : `CLASS ${io.toUpperCase()}: ${student.name} → ${subjectLabel}.`
           );
-          playAudioNotif("class");
+          playAudioNotif("class", classFlag === "LATE");
           showScanNotification({
             student,
             mode: "class",
             timeStr,
             status: "Present",
-            customHeader: `${subjectLabel.toUpperCase()} · TIME ${io.toUpperCase()}`,
+            customHeader: classFlag
+              ? `${subjectLabel.toUpperCase()} · TIME ${io.toUpperCase()} · ${classFlag}`
+              : `${subjectLabel.toUpperCase()} · TIME ${io.toUpperCase()}`,
           });
           logs[today][student.id] = dayRecord;
           applyLocal({ ...current, logs });

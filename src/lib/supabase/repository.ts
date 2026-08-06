@@ -20,7 +20,88 @@ import {
   emptySessionAttendance,
 } from "@/lib/types";
 import { getSupabase } from "./client";
-import { readLocalTimeFormat, writeLocalTimeFormat } from "@/lib/utils";
+import {
+  readLocalCutoffSettings,
+  readLocalTermSettings,
+  readLocalTimeFormat,
+  writeLocalCutoffSettings,
+  writeLocalTermSettings,
+  writeLocalTimeFormat,
+} from "@/lib/utils";
+
+/** Reserved class_attendance marker used when library_attendance table is missing. */
+export const LIBRARY_FALLBACK_CLASS_ID = "__school_library__";
+export const LIBRARY_FALLBACK_SUBJECT = "School Library";
+
+function isLibraryFallbackRow(row: {
+  class_id?: string | null;
+  subject?: string | null;
+}) {
+  return (
+    String(row.class_id || "") === LIBRARY_FALLBACK_CLASS_ID ||
+    String(row.subject || "") === LIBRARY_FALLBACK_SUBJECT
+  );
+}
+
+function isMissingRelationError(error: { message?: string; code?: string } | null) {
+  if (!error) return false;
+  const msg = String(error.message || "").toLowerCase();
+  const code = String(error.code || "");
+  return (
+    code === "PGRST205" ||
+    msg.includes("does not exist") ||
+    msg.includes("schema cache") ||
+    msg.includes("could not find the table") ||
+    msg.includes("404") ||
+    msg.includes("not found")
+  );
+}
+
+const LIBRARY_TABLE_FLAG_KEY = "attendx_library_attendance_ok";
+
+/** null = unknown (probe), true = use library_attendance, false = class_attendance fallback */
+let libraryAttendanceAvailable: boolean | null = null;
+
+function resolveLibraryAttendanceAvailable(): boolean | null {
+  if (libraryAttendanceAvailable !== null) return libraryAttendanceAvailable;
+  if (typeof window !== "undefined") {
+    try {
+      const v = sessionStorage.getItem(LIBRARY_TABLE_FLAG_KEY);
+      if (v === "1") {
+        libraryAttendanceAvailable = true;
+        return true;
+      }
+      if (v === "0") {
+        libraryAttendanceAvailable = false;
+        return false;
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  return null;
+}
+
+function setLibraryAttendanceAvailable(ok: boolean) {
+  libraryAttendanceAvailable = ok;
+  if (typeof window === "undefined") return;
+  try {
+    sessionStorage.setItem(LIBRARY_TABLE_FLAG_KEY, ok ? "1" : "0");
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Force a fresh probe on next fetch/insert (e.g. after migrating library.sql). */
+export function resetLibraryAttendanceProbe() {
+  libraryAttendanceAvailable = null;
+  if (typeof window === "undefined") return;
+  try {
+    sessionStorage.removeItem(LIBRARY_TABLE_FLAG_KEY);
+  } catch {
+    /* ignore */
+  }
+}
 
 function timeToHHMM(value: string | null | undefined) {
   if (!value) return "";
@@ -122,8 +203,12 @@ function applySessionScan(
     ...session,
     scans: [...session.scans, { type: scanType, time }],
   };
-  if (scanType === "in") next.timeIn = time;
-  else next.timeOut = time;
+  if (scanType === "in") {
+    next.timeIn = time;
+    next.timeOut = "";
+  } else {
+    next.timeOut = time;
+  }
   return next;
 }
 
@@ -139,6 +224,10 @@ function ensureLogSlot(
 
 export async function fetchAppState(): Promise<AppDb> {
   const sb = getSupabase();
+  // If sticky "missing" was cached before library.sql migration, clear and re-probe
+  if (resolveLibraryAttendanceAvailable() === false) {
+    resetLibraryAttendanceProbe();
+  }
 
   const [
     membersRes,
@@ -172,17 +261,23 @@ export async function fetchAppState(): Promise<AppDb> {
   const eventAttError = eventAttRes.error;
   const classesError = classesRes.error;
   const libraryError = libraryRes.error;
-  if (eventsError && !String(eventsError.message).includes("does not exist")) {
+  if (eventsError && !isMissingRelationError(eventsError)) {
     console.warn("events:", eventsError.message);
   }
-  if (eventAttError && !String(eventAttError.message).includes("does not exist")) {
+  if (eventAttError && !isMissingRelationError(eventAttError)) {
     console.warn("event_attendance:", eventAttError.message);
   }
-  if (classesError && !String(classesError.message).includes("does not exist")) {
+  if (classesError && !isMissingRelationError(classesError)) {
     console.warn("classes:", classesError.message);
   }
-  if (libraryError && !String(libraryError.message).includes("does not exist")) {
-    console.warn("library_attendance:", libraryError.message);
+  if (libraryError) {
+    if (isMissingRelationError(libraryError)) {
+      setLibraryAttendanceAvailable(false);
+    } else {
+      console.warn("library_attendance:", libraryError.message);
+    }
+  } else {
+    setLibraryAttendanceAvailable(true);
   }
 
   const settingsRow = settingsRes.data;
@@ -190,10 +285,28 @@ export async function fetchAppState(): Promise<AppDb> {
     await saveSettings(DEFAULT_SETTINGS);
   }
 
+  const localTerm = readLocalTermSettings();
+  const localCutoffs = readLocalCutoffSettings();
   const settings: Settings = {
     lateTime: timeToHHMM(settingsRow?.late_time) || DEFAULT_SETTINGS.lateTime,
     timeoutTime:
       timeToHHMM(settingsRow?.timeout_time) || DEFAULT_SETTINGS.timeoutTime,
+    classLateTime:
+      timeToHHMM(settingsRow?.class_late_time) ||
+      localCutoffs?.classLateTime ||
+      DEFAULT_SETTINGS.classLateTime,
+    classTimeoutTime:
+      timeToHHMM(settingsRow?.class_timeout_time) ||
+      localCutoffs?.classTimeoutTime ||
+      DEFAULT_SETTINGS.classTimeoutTime,
+    eventLateTime:
+      timeToHHMM(settingsRow?.event_late_time) ||
+      localCutoffs?.eventLateTime ||
+      DEFAULT_SETTINGS.eventLateTime,
+    eventTimeoutTime:
+      timeToHHMM(settingsRow?.event_timeout_time) ||
+      localCutoffs?.eventTimeoutTime ||
+      DEFAULT_SETTINGS.eventTimeoutTime,
     thresholdMode:
       (settingsRow?.threshold_mode as ThresholdMode) ||
       DEFAULT_SETTINGS.thresholdMode,
@@ -202,6 +315,21 @@ export async function fetchAppState(): Promise<AppDb> {
       readLocalTimeFormat() ||
       DEFAULT_SETTINGS.timeFormat,
     currentEventId: settingsRow?.current_event_id || "",
+    termName:
+      settingsRow?.term_name ??
+      localTerm?.termName ??
+      DEFAULT_SETTINGS.termName ??
+      "",
+    termStartDate:
+      (settingsRow?.term_start_date
+        ? String(settingsRow.term_start_date).slice(0, 10)
+        : "") ||
+      localTerm?.termStartDate ||
+      "",
+    termMonths:
+      Number(settingsRow?.term_months) > 0
+        ? Number(settingsRow.term_months)
+        : localTerm?.termMonths || DEFAULT_SETTINGS.termMonths || 4,
   };
 
   const students = (membersRes.data || []).map(memberFromRow);
@@ -238,11 +366,25 @@ export async function fetchAppState(): Promise<AppDb> {
   for (const row of classRes.data || []) {
     const date = String(row.log_date);
     const memberId = String(row.member_id);
-    const key = String(row.class_id || row.subject);
     const time = timeToHHMMSS(row.scanned_at);
     const scanType: "in" | "out" =
       row.scan_type === "out" ? "out" : row.scan_type === "in" ? "in" : "in";
     const slot = ensureLogSlot(logs, date, memberId);
+
+    // Rows written via library fallback live in class_attendance — map to library
+    if (isLibraryFallbackRow(row)) {
+      const prev = slot.library || emptySessionAttendance();
+      const inferred: "in" | "out" =
+        row.scan_type === "in" || row.scan_type === "out"
+          ? scanType
+          : prev.scans.length % 2 === 0
+            ? "in"
+            : "out";
+      slot.library = applySessionScan(prev, inferred, time);
+      continue;
+    }
+
+    const key = String(row.class_id || row.subject);
     const prev = slot.classes[key] || emptySessionAttendance();
     // Legacy rows without scan_type: first stamp = in, later = out alternating
     const inferred: "in" | "out" =
@@ -295,42 +437,76 @@ export async function fetchAppState(): Promise<AppDb> {
 export async function saveSettings(settings: Settings) {
   const sb = getSupabase();
   if (settings.timeFormat) writeLocalTimeFormat(settings.timeFormat);
+  writeLocalTermSettings({
+    termName: settings.termName || "",
+    termStartDate: settings.termStartDate || "",
+    termMonths: settings.termMonths ?? DEFAULT_SETTINGS.termMonths,
+  });
+  writeLocalCutoffSettings({
+    classLateTime: settings.classLateTime || DEFAULT_SETTINGS.classLateTime,
+    classTimeoutTime:
+      settings.classTimeoutTime || DEFAULT_SETTINGS.classTimeoutTime,
+    eventLateTime: settings.eventLateTime || DEFAULT_SETTINGS.eventLateTime,
+    eventTimeoutTime:
+      settings.eventTimeoutTime || DEFAULT_SETTINGS.eventTimeoutTime,
+  });
+
   const payload: Record<string, unknown> = {
     id: 1,
     late_time: timeToHHMMSS(settings.lateTime) || "08:00:00",
     timeout_time: timeToHHMMSS(settings.timeoutTime) || "16:00:00",
+    class_late_time:
+      timeToHHMMSS(settings.classLateTime || DEFAULT_SETTINGS.classLateTime) ||
+      "08:00:00",
+    class_timeout_time:
+      timeToHHMMSS(
+        settings.classTimeoutTime || DEFAULT_SETTINGS.classTimeoutTime
+      ) || "16:00:00",
+    event_late_time:
+      timeToHHMMSS(settings.eventLateTime || DEFAULT_SETTINGS.eventLateTime) ||
+      "08:00:00",
+    event_timeout_time:
+      timeToHHMMSS(
+        settings.eventTimeoutTime || DEFAULT_SETTINGS.eventTimeoutTime
+      ) || "16:00:00",
     threshold_mode: settings.thresholdMode,
     time_format: settings.timeFormat || "12h",
+    term_name: settings.termName || "",
+    term_start_date: settings.termStartDate || null,
+    term_months: settings.termMonths ?? DEFAULT_SETTINGS.termMonths ?? 4,
   };
   if (settings.currentEventId !== undefined) {
     payload.current_event_id = settings.currentEventId || null;
   }
 
-  const { error } = await sb.from("settings").upsert(payload, { onConflict: "id" });
-  if (error) {
+  const optionalKeys = [
+    "current_event_id",
+    "time_format",
+    "term_name",
+    "term_start_date",
+    "term_months",
+    "class_late_time",
+    "class_timeout_time",
+    "event_late_time",
+    "event_timeout_time",
+  ];
+
+  let { error } = await sb.from("settings").upsert(payload, { onConflict: "id" });
+  // Strip unknown optional columns for older schemas (retry a few times)
+  for (let attempt = 0; attempt < 6 && error; attempt++) {
     const msg = String(error.message);
-    // Retry without optional columns if missing in older schemas
-    if (msg.includes("current_event_id") || msg.includes("time_format")) {
-      if (msg.includes("current_event_id")) delete payload.current_event_id;
-      if (msg.includes("time_format")) delete payload.time_format;
-      const retry = await sb.from("settings").upsert(payload, { onConflict: "id" });
-      if (retry.error) {
-        const msg2 = String(retry.error.message);
-        if (msg2.includes("current_event_id") || msg2.includes("time_format")) {
-          if (msg2.includes("current_event_id")) delete payload.current_event_id;
-          if (msg2.includes("time_format")) delete payload.time_format;
-          const retry2 = await sb
-            .from("settings")
-            .upsert(payload, { onConflict: "id" });
-          if (retry2.error) throw retry2.error;
-          return;
-        }
-        throw retry.error;
+    let stripped = false;
+    for (const key of optionalKeys) {
+      if (msg.includes(key) && key in payload) {
+        delete payload[key];
+        stripped = true;
       }
-      return;
     }
-    throw error;
+    if (!stripped) break;
+    const retry = await sb.from("settings").upsert(payload, { onConflict: "id" });
+    error = retry.error;
   }
+  if (error) throw error;
 }
 
 export async function upsertMember(member: Member) {
@@ -519,15 +695,35 @@ export async function insertLibraryScan(params: {
   memberId: string;
   scanType: "in" | "out";
   scannedAt: string;
-}) {
-  const sb = getSupabase();
-  const { error } = await sb.from("library_attendance").insert({
-    log_date: params.logDate,
-    member_id: params.memberId,
-    scan_type: params.scanType,
-    scanned_at: timeToHHMMSS(params.scannedAt),
+}): Promise<{ synced: boolean }> {
+  const known = resolveLibraryAttendanceAvailable();
+
+  // Prefer dedicated table unless we already know it is missing
+  if (known !== false) {
+    const sb = getSupabase();
+    const { error } = await sb.from("library_attendance").insert({
+      log_date: params.logDate,
+      member_id: params.memberId,
+      scan_type: params.scanType,
+      scanned_at: timeToHHMMSS(params.scannedAt),
+    });
+    if (!error) {
+      setLibraryAttendanceAvailable(true);
+      return { synced: true };
+    }
+    if (!isMissingRelationError(error)) throw error;
+    setLibraryAttendanceAvailable(false);
+  }
+
+  // Fallback: class_attendance with reserved subject
+  await insertClassScan({
+    logDate: params.logDate,
+    memberId: params.memberId,
+    subject: LIBRARY_FALLBACK_SUBJECT,
+    scanType: params.scanType,
+    scannedAt: params.scannedAt,
   });
-  if (error) throw error;
+  return { synced: true };
 }
 
 export async function updateDayStatus(params: {
@@ -630,7 +826,7 @@ export async function factoryResetRemote() {
   ];
   for (const table of tables) {
     const { error } = await sb.from(table).delete().not("id", "is", null);
-    if (error && !String(error.message).toLowerCase().includes("does not exist")) {
+    if (error && !isMissingRelationError(error)) {
       console.warn(`reset ${table}:`, error.message);
     }
   }

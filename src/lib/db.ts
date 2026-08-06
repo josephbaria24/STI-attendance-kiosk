@@ -49,6 +49,10 @@ export async function loadDb(): Promise<AppDb> {
 
       if (!db.settings) db.settings = { ...EMPTY_DB.settings };
       if (!db.settings.timeoutTime) db.settings.timeoutTime = "16:00";
+      if (!db.settings.classLateTime) db.settings.classLateTime = "08:00";
+      if (!db.settings.classTimeoutTime) db.settings.classTimeoutTime = "16:00";
+      if (!db.settings.eventLateTime) db.settings.eventLateTime = "08:00";
+      if (!db.settings.eventTimeoutTime) db.settings.eventTimeoutTime = "16:00";
       if (!db.settings.thresholdMode) db.settings.thresholdMode = "strict";
       if (!db.settings.timeFormat) db.settings.timeFormat = "12h";
       if (db.settings.currentEventId === undefined) db.settings.currentEventId = "";

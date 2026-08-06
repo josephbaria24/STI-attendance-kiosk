@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useAttendance } from "@/context/AttendanceContext";
+import { authFetch, useAuth } from "@/context/AuthContext";
 import type { ViewId } from "@/lib/types";
 import { HugeIcon, type AppIconName } from "./icons";
 
@@ -38,34 +39,110 @@ function BrandMark({ compact = false }: { compact?: boolean }) {
   );
 }
 
-function NavList({ onSelect }: { onSelect: (id: ViewId) => void }) {
+function NavList({
+  onSelect,
+  pendingResets,
+}: {
+  onSelect: (id: ViewId) => void;
+  pendingResets: number;
+}) {
   const { view } = useAttendance();
+  const { canView, canManageUsers, profile } = useAuth();
+  const items = useMemo(
+    () => NAV.filter((item) => canView(item.id)),
+    [canView],
+  );
+  const navRef = useRef<HTMLElement | null>(null);
+  const btnRefs = useRef<Record<string, HTMLButtonElement | null>>({});
+  const [indicator, setIndicator] = useState({
+    top: 0,
+    height: 0,
+    ready: false,
+  });
+
+  const activeId = items.some((item) => item.id === view)
+    ? view
+    : (items[0]?.id ?? null);
+
+  const measureIndicator = () => {
+    const nav = navRef.current;
+    const id = activeId;
+    if (!nav || !id) {
+      setIndicator((prev) => ({ ...prev, ready: false }));
+      return;
+    }
+    const btn = btnRefs.current[id];
+    if (!btn) {
+      setIndicator((prev) => ({ ...prev, ready: false }));
+      return;
+    }
+    const navRect = nav.getBoundingClientRect();
+    const btnRect = btn.getBoundingClientRect();
+    setIndicator({
+      top: btnRect.top - navRect.top + nav.scrollTop,
+      height: btnRect.height,
+      ready: true,
+    });
+  };
+
+  useLayoutEffect(() => {
+    measureIndicator();
+  }, [activeId, items, pendingResets, profile]);
+
+  useEffect(() => {
+    window.addEventListener("resize", measureIndicator);
+    return () => window.removeEventListener("resize", measureIndicator);
+  }, [activeId]);
 
   return (
-    <nav className="flex flex-col gap-1 px-3 py-4">
-      {NAV.map((item, i) => {
-        const active = view === item.id;
+    <nav ref={navRef} className="relative flex flex-col gap-1 px-3 py-4">
+      <span
+        aria-hidden
+        className="pointer-events-none absolute left-3 right-3 top-0 rounded-lg border-l-[3px] border-[var(--primary)] bg-[var(--primary)]/10 shadow-inner transition-[transform,height,opacity] duration-300 ease-[cubic-bezier(0.22,1,0.36,1)]"
+        style={{
+          height: indicator.height,
+          transform: `translateY(${indicator.top}px)`,
+          opacity: indicator.ready ? 1 : 0,
+        }}
+      />
+      {profile && (
+        <div className="mb-2 px-4 text-[11px] font-semibold text-slate-400">
+          @{profile.username}
+          {profile.isSuperadmin ? " · Super admin" : ""}
+        </div>
+      )}
+      {items.map((item, i) => {
+        const active = activeId === item.id;
+        const showBadge =
+          item.id === "admin" && canManageUsers && pendingResets > 0;
         return (
           <button
             key={item.id}
+            ref={(el) => {
+              btnRefs.current[item.id] = el;
+            }}
             type="button"
             onClick={() => onSelect(item.id)}
             style={{ animationDelay: `${i * 40}ms` }}
-            className={`nav-item-anim group relative flex items-center gap-3 rounded-lg px-4 py-3 text-left text-[15px] font-semibold ${
+            className={`nav-item-anim group relative z-10 flex items-center gap-3 rounded-lg px-4 py-3 text-left text-[15px] font-semibold transition-colors duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
               active
-                ? "bg-[var(--primary)]/10 text-[var(--primary)] shadow-inner"
-                : "text-slate-500 hover:bg-slate-100 hover:text-slate-800"
+                ? "text-[var(--primary)]"
+                : "text-slate-500 hover:text-slate-800"
             }`}
           >
-            {active && (
-              <span className="absolute left-0 top-1/2 h-6 w-1 -translate-y-1/2 rounded-r-full bg-[var(--primary)] transition-all duration-300" />
-            )}
             <HugeIcon
               name={item.icon}
               size={18}
-              className={`icon-pop ${active ? "text-[var(--primary)]" : "text-slate-400"}`}
+              className={`icon-pop transition-colors duration-300 ${
+                active ? "text-[var(--primary)]" : "text-slate-400"
+              }`}
             />
-            {item.label}
+            <span className="min-w-0 flex-1 truncate">{item.label}</span>
+            {showBadge && (
+              <span className="rounded-md bg-amber-100 px-1.5 py-0.5 text-[10px] font-bold text-amber-800">
+                {pendingResets}
+              </span>
+            )}
           </button>
         );
       })}
@@ -95,7 +172,7 @@ function WavyDivider() {
   );
 }
 
-function ClockPanel() {
+function ClockPanel({ onLogout }: { onLogout?: () => void }) {
   const { clock } = useAttendance();
   return (
     <div className="mt-auto">
@@ -115,6 +192,16 @@ function ClockPanel() {
             {clock.date}
           </p>
         </div>
+        {onLogout && (
+          <button
+            type="button"
+            onClick={onLogout}
+            className="mt-2.5 flex w-full items-center justify-center gap-2 rounded-lg bg-white/10 px-3 py-2 text-[11px] font-bold uppercase tracking-[0.12em] text-white/80 ring-1 ring-white/15 transition hover:bg-white/20 hover:text-white"
+          >
+            <HugeIcon name="timeOut" size={14} className="text-sky-300" />
+            Sign out
+          </button>
+        )}
         <div className="mt-2.5 text-[10px] font-bold uppercase tracking-[0.14em] text-white/45">
           JP ODASCO · v7.3
         </div>
@@ -123,9 +210,17 @@ function ClockPanel() {
   );
 }
 
-export function Sidebar({ onNavigate }: { onNavigate?: (id: ViewId) => void }) {
+export function Sidebar({
+  onNavigate,
+  onLogout,
+}: {
+  onNavigate?: (id: ViewId) => void;
+  onLogout?: () => void;
+}) {
   const { setView, clock } = useAttendance();
+  const { accessToken, canManageUsers } = useAuth();
   const [open, setOpen] = useState(false);
+  const [pendingResets, setPendingResets] = useState(0);
 
   useEffect(() => {
     if (!open) return;
@@ -139,6 +234,33 @@ export function Sidebar({ onNavigate }: { onNavigate?: (id: ViewId) => void }) {
       window.removeEventListener("keydown", onKey);
     };
   }, [open]);
+
+  useEffect(() => {
+    if (!accessToken || !canManageUsers) {
+      setPendingResets(0);
+      return;
+    }
+    let cancelled = false;
+    async function poll() {
+      try {
+        const res = await authFetch(
+          "/api/admin/reset-requests?status=pending",
+          accessToken!,
+        );
+        if (!res.ok) return;
+        const data = (await res.json()) as { requests?: unknown[] };
+        if (!cancelled) setPendingResets(data.requests?.length ?? 0);
+      } catch {
+        /* ignore */
+      }
+    }
+    void poll();
+    const t = window.setInterval(poll, 30000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(t);
+    };
+  }, [accessToken, canManageUsers]);
 
   function handleSelect(id: ViewId) {
     onNavigate?.(id);
@@ -159,13 +281,18 @@ export function Sidebar({ onNavigate }: { onNavigate?: (id: ViewId) => void }) {
             aria-label={open ? "Close menu" : "Open menu"}
             aria-expanded={open}
             onClick={() => setOpen((v) => !v)}
-            className="flex h-10 w-10 items-center justify-center rounded-lg bg-slate-100 ring-1 ring-slate-200 transition duration-300 hover:scale-105 hover:bg-slate-200"
+            className="relative flex h-10 w-10 items-center justify-center rounded-lg bg-slate-100 ring-1 ring-slate-200 transition duration-300 hover:scale-105 hover:bg-slate-200"
           >
             <HugeIcon
               name={open ? "close" : "menu"}
               size={20}
               className="text-slate-700 transition-transform duration-300"
             />
+            {pendingResets > 0 && (
+              <span className="absolute -right-1 -top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-amber-500 px-1 text-[9px] font-bold text-white">
+                {pendingResets}
+              </span>
+            )}
           </button>
         </div>
       </header>
@@ -201,8 +328,8 @@ export function Sidebar({ onNavigate }: { onNavigate?: (id: ViewId) => void }) {
             </button>
           </div>
           <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
-            <NavList onSelect={handleSelect} />
-            <ClockPanel />
+            <NavList onSelect={handleSelect} pendingResets={pendingResets} />
+            <ClockPanel onLogout={onLogout} />
           </div>
         </aside>
       </div>
@@ -212,8 +339,8 @@ export function Sidebar({ onNavigate }: { onNavigate?: (id: ViewId) => void }) {
           <BrandMark />
         </div>
         <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
-          <NavList onSelect={handleSelect} />
-          <ClockPanel />
+          <NavList onSelect={handleSelect} pendingResets={pendingResets} />
+          <ClockPanel onLogout={onLogout} />
         </div>
       </aside>
     </>

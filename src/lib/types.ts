@@ -15,13 +15,29 @@ export type EventCategory =
   | "other";
 
 export interface Settings {
+  /** Campus Gate late Time In cutoff (HH:mm) */
   lateTime: string;
+  /** Campus Gate early Time Out cutoff (HH:mm) */
   timeoutTime: string;
+  /** Class Session late Time In cutoff */
+  classLateTime?: string;
+  /** Class Session early Time Out cutoff */
+  classTimeoutTime?: string;
+  /** Events late Time In cutoff */
+  eventLateTime?: string;
+  /** Events early Time Out cutoff */
+  eventTimeoutTime?: string;
   thresholdMode: ThresholdMode;
   /** Display / export time format (storage stays 24h) */
   timeFormat: TimeFormat;
   /** Last selected kiosk event (session convenience) */
   currentEventId?: string;
+  /** Active academic term label (e.g. 1st Term AY 2025-2026) */
+  termName?: string;
+  /** Term start date YYYY-MM-DD */
+  termStartDate?: string;
+  /** How many months the term lasts */
+  termMonths?: number;
 }
 
 /** Admin-created venue / activity for kiosk scanning */
@@ -122,9 +138,16 @@ export const EVENT_CATEGORIES: { value: EventCategory; label: string }[] = [
 export const DEFAULT_SETTINGS: Settings = {
   lateTime: "08:00",
   timeoutTime: "16:00",
+  classLateTime: "08:00",
+  classTimeoutTime: "16:00",
+  eventLateTime: "08:00",
+  eventTimeoutTime: "16:00",
   thresholdMode: "strict",
   timeFormat: "12h",
   currentEventId: "",
+  termName: "",
+  termStartDate: "",
+  termMonths: 4,
 };
 
 export const EMPTY_DB: AppDb = {

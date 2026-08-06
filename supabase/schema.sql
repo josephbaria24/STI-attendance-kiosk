@@ -50,7 +50,14 @@ create table if not exists public.settings (
   id              smallint primary key default 1 check (id = 1),
   late_time       time not null default '08:00',
   timeout_time    time not null default '16:00',
+  class_late_time time not null default '08:00',
+  class_timeout_time time not null default '16:00',
+  event_late_time time not null default '08:00',
+  event_timeout_time time not null default '16:00',
   threshold_mode  public.threshold_mode not null default 'strict',
+  term_name       text not null default '',
+  term_start_date date,
+  term_months     integer not null default 4 check (term_months > 0 and term_months <= 24),
   updated_at      timestamptz not null default now()
 );
 
@@ -196,3 +203,39 @@ select
   c.scanned_at
 from public.class_attendance c
 join public.members m on m.id = c.member_id;
+
+-- ---------------------------------------------------------------------------
+-- 8) library_attendance  (School Library In/Out — not tied to events)
+-- ---------------------------------------------------------------------------
+create table if not exists public.library_attendance (
+  id            uuid primary key default gen_random_uuid(),
+  log_date      date not null,
+  member_id     text not null references public.members (id) on delete cascade,
+  scan_type     text not null default 'in' check (scan_type in ('in', 'out')),
+  scanned_at    time not null,
+  created_at    timestamptz not null default now()
+);
+
+create index if not exists library_attendance_date_idx
+  on public.library_attendance (log_date);
+create index if not exists library_attendance_member_idx
+  on public.library_attendance (member_id, log_date);
+
+alter table public.library_attendance enable row level security;
+
+drop policy if exists "library_attendance_anon_all" on public.library_attendance;
+create policy "library_attendance_anon_all" on public.library_attendance
+  for all to anon, authenticated using (true) with check (true);
+
+create or replace view public.v_library_logs as
+select
+  la.log_date,
+  la.member_id,
+  m.name as member_name,
+  m.distinction,
+  m.grade,
+  m.section,
+  la.scan_type,
+  la.scanned_at
+from public.library_attendance la
+join public.members m on m.id = la.member_id;

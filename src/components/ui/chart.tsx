@@ -24,6 +24,8 @@ export function ChartContainer({
   className,
   children,
   config,
+  style,
+  ...rest
 }: React.ComponentProps<"div"> & {
   config: ChartConfig;
   children: React.ComponentProps<
@@ -37,10 +39,12 @@ export function ChartContainer({
     <ChartContext.Provider value={{ config }}>
       <div
         data-chart={chartId}
+        style={style}
         className={cn(
           "[&_.recharts-cartesian-axis-tick_text]:fill-slate-500 [&_.recharts-cartesian-grid_line]:stroke-slate-200 [&_.recharts-tooltip-cursor]:stroke-slate-300 [&_.recharts-reference-line_line]:stroke-slate-300",
           className
         )}
+        {...rest}
       >
         <style
           // eslint-disable-next-line react/no-danger

@@ -3,12 +3,17 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { Html5Qrcode } from "html5-qrcode";
 import { useAttendance } from "@/context/AttendanceContext";
+import { useAuth } from "@/context/AuthContext";
 import { resumeAudio } from "@/lib/audio";
 import { Button, Card, Field, PageHeader, SectionTitle, inputClass } from "./ui";
 import { HugeIcon } from "./icons";
 import { Combobox } from "./ui/combobox";
 import { classLabel } from "@/lib/types";
-import { memberDetails } from "@/lib/utils";
+import { formatDisplayTime, getTargetCutoffs, memberDetails } from "@/lib/utils";
+
+function nowHms(d = new Date()) {
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`;
+}
 
 export function ScannerView() {
   const {
@@ -26,6 +31,7 @@ export function ScannerView() {
     processAttendanceRecord,
     showToast,
   } = useAttendance();
+  const { can } = useAuth();
 
   const readerDomId = `qr-reader-${useId().replace(/:/g, "")}`;
   const [cameras, setCameras] = useState<{ id: string; label: string }[]>([]);
@@ -48,6 +54,7 @@ export function ScannerView() {
   const lastScan = useRef({ data: "", time: 0 });
   const processRef = useRef(processAttendanceRecord);
   const isOpen = db.settings.thresholdMode === "open";
+  const [clockNow, setClockNow] = useState(() => new Date());
   const activeEvents = (db.events || []).filter((e) => e.active);
   const activeClasses = (db.classes || []).filter((c) => c.active);
   const selectedEvent = activeEvents.find((e) => e.id === currentEventId);
@@ -66,6 +73,11 @@ export function ScannerView() {
   }, [db.students, manualId]);
 
   type AttendanceTarget = "gate" | "class" | "event" | "library";
+  const canGate = can("scanner.gate");
+  const canClass = can("scanner.class");
+  const canEvent = can("scanner.event");
+  const canLibrary = can("scanner.library");
+
   const attendanceTarget: AttendanceTarget =
     scanMode === "class"
       ? "class"
@@ -75,6 +87,24 @@ export function ScannerView() {
           ? "library"
           : "gate";
 
+  useEffect(() => {
+    const allowed: Record<AttendanceTarget, boolean> = {
+      gate: canGate,
+      class: canClass,
+      event: canEvent,
+      library: canLibrary,
+    };
+    if (allowed[attendanceTarget]) return;
+    if (canGate) selectGate();
+    else if (canClass) selectClass();
+    else if (canLibrary) selectLibrary();
+    else if (canEvent) {
+      const first = (db.events || []).find((e) => e.active);
+      if (first) selectEvent(first.id);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canGate, canClass, canEvent, canLibrary, attendanceTarget]);
+
   const ioActive =
     attendanceTarget === "gate"
       ? scanMode === "in" || scanMode === "out"
@@ -83,7 +113,8 @@ export function ScannerView() {
       : sessionIo;
 
   function selectGate() {
-    setScanMode(sessionIo === "out" ? "out" : "in");
+    const dir = sessionIo === "out" && outAllowed ? "out" : "in";
+    setScanMode(dir);
   }
 
   function selectClass() {
@@ -99,7 +130,20 @@ export function ScannerView() {
     setScanMode("library");
   }
 
+  const cutoffTarget =
+    attendanceTarget === "class" || attendanceTarget === "event"
+      ? attendanceTarget
+      : "gate";
+  const targetCutoffs = getTargetCutoffs(db.settings, cutoffTarget);
+  const timeoutCutoff = `${targetCutoffs.timeoutTime || "16:00"}:00`;
+  const outAllowed = isOpen || nowHms(clockNow) >= timeoutCutoff;
+  const timeoutLabel = formatDisplayTime(
+    targetCutoffs.timeoutTime || "16:00",
+    db.settings.timeFormat || "12h"
+  );
+
   function setIoDirection(dir: "in" | "out") {
+    if (dir === "out" && !outAllowed) return;
     setSessionIo(dir);
     if (attendanceTarget === "gate") setScanMode(dir);
   }
@@ -107,6 +151,19 @@ export function ScannerView() {
   useEffect(() => {
     processRef.current = processAttendanceRecord;
   }, [processAttendanceRecord]);
+
+  useEffect(() => {
+    const tick = () => setClockNow(new Date());
+    tick();
+    const id = window.setInterval(tick, 15_000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  useEffect(() => {
+    if (outAllowed || ioActive !== "out") return;
+    setSessionIo("in");
+    if (attendanceTarget === "gate") setScanMode("in");
+  }, [outAllowed, ioActive, attendanceTarget, setSessionIo, setScanMode]);
 
   useEffect(() => {
     if (!manualOpen) return;
@@ -365,7 +422,12 @@ export function ScannerView() {
     };
   }, [stopScanner]);
 
-  const ioLabel = ioActive === "out" ? "Time Out" : "Time In";
+  const ioLabel =
+    attendanceTarget === "library"
+      ? "Auto In / Out"
+      : ioActive === "out"
+        ? "Time Out"
+        : "Time In";
   let targetTitle = "Campus Gate";
   let targetDetail = "Daily roster";
   let targetTone = "gate" as "gate" | "class" | "event" | "library" | "warn";
@@ -382,7 +444,7 @@ export function ScannerView() {
     }
   } else if (attendanceTarget === "library") {
     targetTitle = "School Library";
-    targetDetail = "Library visit log";
+    targetDetail = "Auto In / Out · 1 min cooldown";
     targetTone = "library";
   } else if (attendanceTarget === "event") {
     if (selectedEvent) {
@@ -423,9 +485,11 @@ export function ScannerView() {
         </span>
         <span
           className={`rounded-md px-1.5 py-0.5 text-[10px] font-extrabold uppercase tracking-wide ${
-            ioActive === "out"
-              ? "bg-orange-600 text-white"
-              : "bg-sky-600 text-white"
+            attendanceTarget === "library"
+              ? "bg-indigo-800 text-white"
+              : ioActive === "out"
+                ? "bg-orange-600 text-white"
+                : "bg-sky-600 text-white"
           }`}
         >
           {ioLabel}
@@ -448,55 +512,88 @@ export function ScannerView() {
             <SectionTitle>1. Select Mode</SectionTitle>
             <span
               className={`rounded-lg px-2.5 py-1 text-[11px] font-bold tracking-wide ${
-                isOpen
-                  ? "bg-sky-100 text-sky-800 ring-1 ring-sky-200"
-                  : "bg-emerald-50 text-emerald-800 ring-1 ring-emerald-200"
+                attendanceTarget === "library"
+                  ? "bg-indigo-50 text-indigo-800 ring-1 ring-indigo-200"
+                  : isOpen
+                    ? "bg-sky-100 text-sky-800 ring-1 ring-sky-200"
+                    : "bg-emerald-50 text-emerald-800 ring-1 ring-emerald-200"
               }`}
             >
-              {isOpen ? "Open Time Active" : "Strict Rules Enforced"}
+              {attendanceTarget === "library"
+                ? "No Strict Rules"
+                : isOpen
+                  ? "Open Time Active"
+                  : "Strict Rules Enforced"}
             </span>
           </div>
 
-          <div className="mb-5 flex flex-wrap gap-1 rounded-xl bg-slate-100/90 p-1 ring-1 ring-slate-200/80">
-            {(
-              [
-                ["in", "TIME IN", "bg-sky-600", "timeIn"],
-                ["out", "TIME OUT", "bg-orange-500", "timeOut"],
-              ] as const
-            ).map(([mode, label, activeBg, iconName]) => (
-              <button
-                key={mode}
-                type="button"
-                onClick={() => setIoDirection(mode)}
-                className={`group mode-btn-anim flex min-w-[72px] flex-1 items-center justify-center gap-1.5 rounded-lg py-2.5 text-center text-sm font-bold ${
-                  ioActive === mode
-                    ? `${activeBg} text-white shadow-sm`
-                    : mode === "in"
-                      ? "text-sky-700 hover:bg-sky-50 hover:text-sky-800"
-                      : "text-orange-700 hover:bg-orange-50 hover:text-orange-800"
-                }`}
-              >
-                <HugeIcon
-                  name={iconName}
-                  size={16}
-                  className="icon-pop opacity-90"
-                />
-                <span>{label}</span>
-              </button>
-            ))}
-          </div>
-
-          {isOpen && attendanceTarget === "gate" && (
-            <div className="mb-5 rounded-xl bg-[var(--primary)] px-3 py-2.5 text-center text-sm font-bold text-white">
-              OPEN TIME MODE — gate scans auto-toggle In / Out
+          {attendanceTarget === "library" ? (
+            <div className="mb-5 rounded-xl bg-indigo-600 px-3 py-2.5 text-center text-sm font-bold text-white">
+              LIBRARY AUTO MODE — no Strict rules · first scan = In, next after 1
+              min = Out
             </div>
-          )}
+          ) : (
+            <>
+              <div className="mb-5 flex flex-wrap gap-1 rounded-xl bg-slate-100/90 p-1 ring-1 ring-slate-200/80">
+                {(
+                  [
+                    ["in", "TIME IN", "bg-sky-600", "timeIn"],
+                    ["out", "TIME OUT", "bg-orange-500", "timeOut"],
+                  ] as const
+                ).map(([mode, label, activeBg, iconName]) => {
+                  const locked = mode === "out" && !outAllowed;
+                  return (
+                    <button
+                      key={mode}
+                      type="button"
+                      disabled={locked}
+                      aria-disabled={locked}
+                      title={
+                        locked
+                          ? `Time Out unlocks at ${timeoutLabel} (Strict Mode)`
+                          : undefined
+                      }
+                      onClick={() => setIoDirection(mode)}
+                      className={`group mode-btn-anim flex min-w-[72px] flex-1 items-center justify-center gap-1.5 rounded-lg py-2.5 text-center text-sm font-bold ${
+                        locked
+                          ? "cursor-not-allowed bg-slate-200/80 text-slate-400 opacity-60"
+                          : ioActive === mode
+                            ? `${activeBg} text-white shadow-sm`
+                            : mode === "in"
+                              ? "text-sky-700 hover:bg-sky-50 hover:text-sky-800"
+                              : "text-orange-700 hover:bg-orange-50 hover:text-orange-800"
+                      }`}
+                    >
+                      <HugeIcon
+                        name={iconName}
+                        size={16}
+                        className="icon-pop opacity-90"
+                      />
+                      <span>{label}</span>
+                    </button>
+                  );
+                })}
+              </div>
 
-          {attendanceTarget !== "gate" && (
-            <p className="mb-5 text-[12px] font-medium text-slate-500">
-              Time In / Out applies to the selected class, library, or event
-              (separate from campus gate).
-            </p>
+              {!isOpen && !outAllowed && (
+                <p className="mb-5 text-[12px] font-medium text-slate-500">
+                  Strict Mode — Time Out unlocks at {timeoutLabel}.
+                </p>
+              )}
+
+              {isOpen && attendanceTarget === "gate" && (
+                <div className="mb-5 rounded-xl bg-[var(--primary)] px-3 py-2.5 text-center text-sm font-bold text-white">
+                  OPEN TIME MODE — gate scans auto-toggle In / Out
+                </div>
+              )}
+
+              {attendanceTarget !== "gate" && (
+                <p className="mb-5 text-[12px] font-medium text-slate-500">
+                  Time In / Out applies to the selected class or event (separate
+                  from campus gate).
+                </p>
+              )}
+            </>
           )}
 
           <SectionTitle>2. Select Attendance Target</SectionTitle>
@@ -506,6 +603,7 @@ export function ScannerView() {
           </p>
 
           <div className="mb-4 grid grid-cols-3 gap-1.5">
+            {canGate && (
             <button
               type="button"
               onClick={selectGate}
@@ -543,7 +641,9 @@ export function ScannerView() {
                 </span>
               </span>
             </button>
+            )}
 
+            {canClass && (
             <button
               type="button"
               onClick={selectClass}
@@ -583,7 +683,9 @@ export function ScannerView() {
                 </span>
               </span>
             </button>
+            )}
 
+            {canLibrary && (
             <button
               type="button"
               onClick={selectLibrary}
@@ -619,10 +721,11 @@ export function ScannerView() {
                       : "text-slate-500"
                   }`}
                 >
-                  Visit log
+                  Auto in / out
                 </span>
               </span>
             </button>
+            )}
           </div>
 
           {attendanceTarget === "class" && (
@@ -659,6 +762,8 @@ export function ScannerView() {
             </div>
           )}
 
+          {canEvent && (
+          <>
           <div className="mb-3.5 flex items-center gap-2 px-1 text-slate-400">
             <span className="h-px flex-1 bg-slate-300" />
             <span className="text-[10px] font-extrabold uppercase tracking-[0.18em]">
@@ -728,8 +833,12 @@ export function ScannerView() {
               </div>
             )}
           </div>
+          </>
+          )}
 
-          {isOpen && attendanceTarget !== "gate" && (
+          {isOpen &&
+            attendanceTarget !== "gate" &&
+            attendanceTarget !== "library" && (
             <div className="mb-2 rounded-lg bg-sky-50 px-3 py-2 text-[12px] font-medium text-sky-800 ring-1 ring-sky-100">
               Gate open-time auto in/out is paused while Class / Event target is
               active. Use Time In / Out above for this session.

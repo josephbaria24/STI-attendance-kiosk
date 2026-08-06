@@ -1,11 +1,12 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { QRCodeSVG } from "qrcode.react";
 import * as XLSX from "xlsx";
 import { useAttendance } from "@/context/AttendanceContext";
-import { memberDetails } from "@/lib/utils";
+import { useAuth } from "@/context/AuthContext";
+import { formatTermLabel, memberDetails } from "@/lib/utils";
 import type { EventCategory, Member, Role } from "@/lib/types";
 import { EVENT_CATEGORIES, categoryLabel } from "@/lib/types";
 import {
@@ -20,6 +21,7 @@ import {
 } from "./ui";
 import { HugeIcon } from "./icons";
 import { ExpandableText } from "./ExpandableText";
+import { UserManagement } from "./UserManagement";
 
 const MEMBERSHIP_KEY = "attendx_membership_types_v1";
 type MembershipMap = Record<Role, string[]>;
@@ -48,6 +50,7 @@ export function AdminView() {
     deleteClass,
     showToast,
   } = useAttendance();
+  const { can, canManageUsers, profile } = useAuth();
 
   const [regRole, setRegRole] = useState<Role>("student");
   const [regId, setRegId] = useState("");
@@ -79,9 +82,14 @@ export function AdminView() {
   const [clsSection, setClsSection] = useState("");
   const [clsDescription, setClsDescription] = useState("");
   const [classSearch, setClassSearch] = useState("");
-  const [adminTab, setAdminTabState] = useState<
-    "settings" | "events" | "classes" | "roster" | "ids"
-  >(() => {
+  type AdminTab =
+    | "settings"
+    | "events"
+    | "classes"
+    | "roster"
+    | "ids"
+    | "users";
+  const [adminTab, setAdminTabState] = useState<AdminTab>(() => {
     if (typeof window === "undefined") return "settings";
     try {
       const raw = localStorage.getItem("attendx_ui_state_v1");
@@ -93,7 +101,8 @@ export function AdminView() {
         tab === "events" ||
         tab === "classes" ||
         tab === "roster" ||
-        tab === "ids"
+        tab === "ids" ||
+        tab === "users"
       ) {
         return tab;
       }
@@ -103,9 +112,7 @@ export function AdminView() {
     return "settings";
   });
 
-  function setAdminTab(
-    tab: "settings" | "events" | "classes" | "roster" | "ids"
-  ) {
+  function setAdminTab(tab: AdminTab) {
     setAdminTabState(tab);
     try {
       const raw = localStorage.getItem("attendx_ui_state_v1");
@@ -121,14 +128,103 @@ export function AdminView() {
 
   const printReady = useRef(false);
   const importInputRef = useRef<HTMLInputElement | null>(null);
+  const adminTabListRef = useRef<HTMLDivElement | null>(null);
+  const adminTabBtnRefs = useRef<Record<string, HTMLButtonElement | null>>({});
+  const [tabIndicator, setTabIndicator] = useState({
+    left: 0,
+    width: 0,
+    ready: false,
+  });
 
-  const tabs = [
-    { id: "settings" as const, label: "Settings", icon: "admin" as const },
-    { id: "events" as const, label: "Events", icon: "event" as const },
-    { id: "classes" as const, label: "Classes", icon: "classMode" as const },
-    { id: "roster" as const, label: "Roster", icon: "user" as const },
-    { id: "ids" as const, label: "ID Cards", icon: "scanner" as const },
-  ];
+  const tabs = useMemo(
+    () =>
+      [
+        {
+          id: "settings" as const,
+          label: "Settings",
+          icon: "admin" as const,
+          perm: "admin.settings",
+        },
+        {
+          id: "events" as const,
+          label: "Events",
+          icon: "event" as const,
+          perm: "admin.events",
+        },
+        {
+          id: "classes" as const,
+          label: "Classes",
+          icon: "classMode" as const,
+          perm: "admin.classes",
+        },
+        {
+          id: "roster" as const,
+          label: "Roster",
+          icon: "user" as const,
+          perm: "admin.roster",
+        },
+        {
+          id: "ids" as const,
+          label: "ID Cards",
+          icon: "scanner" as const,
+          perm: "admin.ids",
+        },
+        {
+          id: "users" as const,
+          label: "Users",
+          icon: "user" as const,
+          perm: "admin.users",
+        },
+      ].filter((tab) => {
+        if (tab.id === "users") return canManageUsers;
+        return can(tab.perm);
+      }),
+    [can, canManageUsers],
+  );
+
+  const activeAdminTab =
+    tabs.find((t) => t.id === adminTab)?.id ?? tabs[0]?.id ?? null;
+
+  useLayoutEffect(() => {
+    const list = adminTabListRef.current;
+    const id = activeAdminTab;
+    if (!list || !id) {
+      setTabIndicator((prev) => ({ ...prev, ready: false }));
+      return;
+    }
+    const btn = adminTabBtnRefs.current[id];
+    if (!btn) {
+      setTabIndicator((prev) => ({ ...prev, ready: false }));
+      return;
+    }
+    setTabIndicator({
+      left: btn.offsetLeft,
+      width: btn.offsetWidth,
+      ready: true,
+    });
+  }, [activeAdminTab, tabs]);
+
+  useEffect(() => {
+    const list = adminTabListRef.current;
+    const onResizeOrScroll = () => {
+      const el = adminTabListRef.current;
+      const id = activeAdminTab;
+      if (!el || !id) return;
+      const btn = adminTabBtnRefs.current[id];
+      if (!btn) return;
+      setTabIndicator({
+        left: btn.offsetLeft,
+        width: btn.offsetWidth,
+        ready: true,
+      });
+    };
+    window.addEventListener("resize", onResizeOrScroll);
+    list?.addEventListener("scroll", onResizeOrScroll, { passive: true });
+    return () => {
+      window.removeEventListener("resize", onResizeOrScroll);
+      list?.removeEventListener("scroll", onResizeOrScroll);
+    };
+  }, [activeAdminTab]);
 
   const filteredStudents = useMemo(() => {
     const q = rosterSearch.toLowerCase().trim();
@@ -499,43 +595,79 @@ export function AdminView() {
   }
 
   const isOpen = db.settings.thresholdMode === "open";
+  const settingsControlClass =
+    "w-full rounded-xl border-2 border-slate-300 bg-white px-3.5 py-2.5 text-sm text-slate-800 shadow-[inset_0_1px_2px_rgba(15,23,42,0.06)] outline-none transition placeholder:text-slate-400 hover:border-slate-400 focus:border-[var(--primary)] focus:ring-4 focus:ring-[var(--primary)]/15";
 
   return (
     <section>
       <PageHeader
         title="Admin Control"
-        subtitle="Manage settings, events, roster, and ID cards by module"
+        subtitle={
+          profile
+            ? `Signed in as @${profile.username}${profile.isSuperadmin ? " · Super admin" : ""}`
+            : "Manage settings, events, roster, and ID cards by module"
+        }
         icon={<HugeIcon name="admin" size={22} />}
       />
 
-      <div
-        role="tablist"
-        aria-label="Admin modules"
-        className="mb-6 flex flex-wrap gap-2 rounded-2xl border border-slate-200/80 bg-white/80 p-1.5 shadow-sm backdrop-blur-sm"
-      >
-        {tabs.map((tab) => {
-          const active = adminTab === tab.id;
-          return (
-            <button
-              key={tab.id}
-              type="button"
-              role="tab"
-              aria-selected={active}
-              onClick={() => setAdminTab(tab.id)}
-              className={`inline-flex flex-1 items-center justify-center gap-2 rounded-xl px-3 py-2.5 text-sm font-semibold transition sm:flex-none sm:px-4 ${
-                active
-                  ? "bg-[var(--primary)] text-white shadow-sm shadow-emerald-900/20"
-                  : "text-slate-600 hover:bg-slate-100 hover:text-slate-900"
-              }`}
-            >
-              <HugeIcon name={tab.icon} size={16} />
-              {tab.label}
-            </button>
-          );
-        })}
-      </div>
+      {tabs.length === 0 ? (
+        <Card>
+          <p className="text-sm text-slate-500">
+            No admin modules are enabled for your account.
+          </p>
+        </Card>
+      ) : (
+        <div
+          ref={adminTabListRef}
+          role="tablist"
+          aria-label="Admin modules"
+          className="relative mb-6 flex flex-nowrap gap-2 overflow-x-auto rounded-2xl border border-slate-200/80 bg-white/80 p-1.5 shadow-sm backdrop-blur-sm"
+        >
+          <span
+            aria-hidden
+            className="pointer-events-none absolute top-1.5 bottom-1.5 rounded-xl bg-[var(--primary)] shadow-sm shadow-emerald-900/20 transition-[transform,width,opacity] duration-300 ease-[cubic-bezier(0.22,1,0.36,1)]"
+            style={{
+              width: tabIndicator.width,
+              transform: `translateX(${tabIndicator.left}px)`,
+              opacity: tabIndicator.ready ? 1 : 0,
+            }}
+          />
+          {tabs.map((tab) => {
+            const active = activeAdminTab === tab.id;
+            return (
+              <button
+                key={tab.id}
+                ref={(el) => {
+                  adminTabBtnRefs.current[tab.id] = el;
+                }}
+                type="button"
+                role="tab"
+                aria-selected={active}
+                onClick={() => setAdminTab(tab.id)}
+                className={`relative z-10 inline-flex shrink-0 items-center justify-center gap-2 rounded-xl px-3 py-2.5 text-sm font-semibold transition-colors duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] sm:px-4 ${
+                  active
+                    ? "text-white"
+                    : "text-slate-600 hover:text-slate-900"
+                }`}
+              >
+                <HugeIcon
+                  name={tab.icon}
+                  size={16}
+                  className={`transition-transform duration-300 ${
+                    active ? "scale-110" : "scale-100"
+                  }`}
+                />
+                {tab.label}
+              </button>
+            );
+          })}
+        </div>
+      )}
 
-      {adminTab === "events" && (
+      <div key={activeAdminTab ?? "none"} className="admin-tab-enter">
+      {activeAdminTab === "users" && canManageUsers && <UserManagement />}
+
+      {activeAdminTab === "events" && can("admin.events") && (
       <Card>
         <SectionTitle>Events & Venues</SectionTitle>
         <p className="mb-4 mt-2 text-[13px] text-slate-500">
@@ -754,7 +886,7 @@ export function AdminView() {
       </Card>
       )}
 
-      {adminTab === "classes" && (
+      {activeAdminTab === "classes" && can("admin.classes") && (
         <Card>
           <SectionTitle>Subjects & Classrooms</SectionTitle>
           <p className="mb-4 mt-2 text-[13px] text-slate-500">
@@ -891,98 +1023,388 @@ export function AdminView() {
         </Card>
       )}
 
-      {adminTab === "settings" && (
-      <Card>
-          <SectionTitle>System Operational Thresholds</SectionTitle>
-          <div className="mb-4" />
-          <Field label="Threshold Optimization Rule">
-            <select
-              className={inputClass}
-              value={db.settings.thresholdMode}
-              onChange={(e) =>
-                updateSettings({
-                  thresholdMode: e.target.value as "strict" | "open",
-                })
-              }
-            >
-              <option value="strict">
-                Strict Mode (Enforce Late / Early Out Flags)
-              </option>
-              <option value="open">
-                Open Time Mode (Flexible Open Scanning - No Penalties)
-              </option>
-            </select>
-            <small className="mt-1 text-[11px] text-slate-500">
-              Choosing <b>Open Time Mode</b> allows students to scan at any hour
-              without being marked Late or Early Departure.
-            </small>
-          </Field>
+      {activeAdminTab === "settings" && can("admin.settings") && (
+        <div className="flex flex-col gap-8 pb-4">
+          {/* Thresholds */}
+          <Card className="!mb-0 overflow-hidden !p-0 ring-1 ring-slate-200/90">
+            <div className="border-b border-emerald-900/10 bg-gradient-to-br from-[var(--primary)] to-[var(--sidebar)] px-6 py-5 text-white">
+              <div className="flex items-center gap-3">
+                <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-white/15 ring-1 ring-white/25">
+                  <HugeIcon name="admin" size={18} />
+                </span>
+                <div>
+                  <h2 className="m-0 text-base font-extrabold tracking-tight">
+                    System Operational Thresholds
+                  </h2>
+                  <p className="mt-1 text-[12px] font-medium text-white/75">
+                    Gate scan rules and late / early-out cutoffs
+                  </p>
+                </div>
+              </div>
+            </div>
 
-          <div
-            className={`mb-3 grid gap-3 md:grid-cols-2 ${
-              isOpen ? "pointer-events-none opacity-40" : ""
-            }`}
-          >
-            <Field label="Time In Late Cutoff" className="mb-0">
-              <input
-                type="time"
-                className={inputClass}
-                value={db.settings.lateTime}
-                onChange={(e) => updateSettings({ lateTime: e.target.value })}
-              />
-              <small className="text-[11px] text-slate-500">
-                Scans after this are marked <b>Late</b>.
-              </small>
-            </Field>
-            <Field label="Early Time Out Cutoff" className="mb-0">
-              <input
-                type="time"
-                className={inputClass}
-                value={db.settings.timeoutTime}
-                onChange={(e) =>
-                  updateSettings({ timeoutTime: e.target.value })
-                }
-              />
-              <small className="text-[11px] text-slate-500">
-                Scans before this are flagged.
-              </small>
-            </Field>
+            <div className="space-y-5 bg-slate-50/80 p-6 md:p-7">
+              <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <div className="text-[11px] font-extrabold uppercase tracking-wider text-slate-500">
+                      Threshold Mode
+                    </div>
+                    <p className="mt-1 text-[12px] text-slate-500">
+                      Choose how gate scans enforce late and early-out flags
+                    </p>
+                  </div>
+                  <span
+                    className={`rounded-lg px-2.5 py-1 text-[11px] font-bold tracking-wide ring-1 ${
+                      isOpen
+                        ? "bg-sky-50 text-sky-800 ring-sky-200"
+                        : "bg-emerald-50 text-emerald-800 ring-emerald-200"
+                    }`}
+                  >
+                    {isOpen ? "Open Time" : "Strict"}
+                  </span>
+                </div>
+
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <button
+                    type="button"
+                    onClick={() => updateSettings({ thresholdMode: "strict" })}
+                    className={`rounded-xl border-2 px-4 py-3.5 text-left transition ${
+                      !isOpen
+                        ? "border-[var(--primary)] bg-[var(--primary)] text-white shadow-md shadow-emerald-900/15"
+                        : "border-slate-200 bg-slate-50 text-slate-700 hover:border-slate-300 hover:bg-white"
+                    }`}
+                  >
+                    <div className="text-sm font-extrabold">Strict Mode</div>
+                    <div
+                      className={`mt-1.5 text-[11px] leading-snug ${
+                        !isOpen ? "text-white/80" : "text-slate-500"
+                      }`}
+                    >
+                      Enforce late / early-out flags. Time Out locks until cutoff.
+                    </div>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => updateSettings({ thresholdMode: "open" })}
+                    className={`rounded-xl border-2 px-4 py-3.5 text-left transition ${
+                      isOpen
+                        ? "border-sky-600 bg-sky-600 text-white shadow-md shadow-sky-900/15"
+                        : "border-slate-200 bg-slate-50 text-slate-700 hover:border-slate-300 hover:bg-white"
+                    }`}
+                  >
+                    <div className="text-sm font-extrabold">Open Time Mode</div>
+                    <div
+                      className={`mt-1.5 text-[11px] leading-snug ${
+                        isOpen ? "text-white/80" : "text-slate-500"
+                      }`}
+                    >
+                      Flexible scanning — no late or early-departure penalties.
+                    </div>
+                  </button>
+                </div>
+              </div>
+
+              <div
+                className={`space-y-4 ${
+                  isOpen ? "pointer-events-none opacity-45" : ""
+                }`}
+              >
+                {(
+                  [
+                    {
+                      key: "gate",
+                      title: "Campus Gate",
+                      hint: "Daily roster late / early-out flags",
+                      lateKey: "lateTime" as const,
+                      outKey: "timeoutTime" as const,
+                      lateVal: db.settings.lateTime,
+                      outVal: db.settings.timeoutTime,
+                    },
+                    {
+                      key: "class",
+                      title: "Class Session",
+                      hint: "Applies to all active classrooms",
+                      lateKey: "classLateTime" as const,
+                      outKey: "classTimeoutTime" as const,
+                      lateVal:
+                        db.settings.classLateTime ||
+                        db.settings.lateTime ||
+                        "08:00",
+                      outVal:
+                        db.settings.classTimeoutTime ||
+                        db.settings.timeoutTime ||
+                        "16:00",
+                    },
+                    {
+                      key: "event",
+                      title: "Events",
+                      hint: "Applies to all active events / venues",
+                      lateKey: "eventLateTime" as const,
+                      outKey: "eventTimeoutTime" as const,
+                      lateVal:
+                        db.settings.eventLateTime ||
+                        db.settings.lateTime ||
+                        "08:00",
+                      outVal:
+                        db.settings.eventTimeoutTime ||
+                        db.settings.timeoutTime ||
+                        "16:00",
+                    },
+                  ] as const
+                ).map((target) => (
+                  <div
+                    key={target.key}
+                    className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm"
+                  >
+                    <div className="mb-4 flex flex-wrap items-end justify-between gap-2">
+                      <div>
+                        <div className="text-sm font-extrabold text-slate-800">
+                          {target.title}
+                        </div>
+                        <p className="mt-0.5 text-[12px] text-slate-500">
+                          {target.hint}
+                        </p>
+                      </div>
+                    </div>
+                    <div className="grid gap-4 md:grid-cols-2">
+                      <div className="rounded-xl border border-sky-200/80 bg-sky-50/40 p-3.5 ring-1 ring-sky-100">
+                        <div className="mb-2 flex items-center gap-2">
+                          <span className="rounded-md bg-sky-100 px-2 py-0.5 text-[10px] font-extrabold uppercase tracking-wide text-sky-800">
+                            Time In
+                          </span>
+                          <span className="text-[11px] font-semibold text-slate-500">
+                            Late cutoff
+                          </span>
+                        </div>
+                        <input
+                          type="time"
+                          className={`${settingsControlClass} font-semibold tabular-nums`}
+                          value={target.lateVal}
+                          onChange={(e) =>
+                            updateSettings({ [target.lateKey]: e.target.value })
+                          }
+                        />
+                        <p className="mt-2 text-[11px] text-slate-500">
+                          Scans after this are flagged late.
+                        </p>
+                      </div>
+                      <div className="rounded-xl border border-orange-200/80 bg-orange-50/40 p-3.5 ring-1 ring-orange-100">
+                        <div className="mb-2 flex items-center gap-2">
+                          <span className="rounded-md bg-orange-100 px-2 py-0.5 text-[10px] font-extrabold uppercase tracking-wide text-orange-800">
+                            Time Out
+                          </span>
+                          <span className="text-[11px] font-semibold text-slate-500">
+                            Early cutoff
+                          </span>
+                        </div>
+                        <input
+                          type="time"
+                          className={`${settingsControlClass} font-semibold tabular-nums`}
+                          value={target.outVal}
+                          onChange={(e) =>
+                            updateSettings({ [target.outKey]: e.target.value })
+                          }
+                        />
+                        <p className="mt-2 text-[11px] text-slate-500">
+                          Scans before this are early out. Kiosk Time Out unlocks
+                          here.
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+                <p className="rounded-xl bg-slate-100/90 px-3.5 py-2.5 text-[12px] font-medium text-slate-600 ring-1 ring-slate-200">
+                  School Library uses Auto In / Out and does not use these
+                  cutoffs.
+                </p>
+              </div>
+              {isOpen && (
+                <p className="rounded-xl bg-sky-50 px-3.5 py-2.5 text-[12px] font-medium text-sky-800 ring-1 ring-sky-100">
+                  Cutoffs are paused while Open Time Mode is active.
+                </p>
+              )}
+            </div>
+          </Card>
+
+          {/* Academic Term */}
+          <Card className="!mb-0 overflow-hidden !p-0 ring-1 ring-slate-200/90">
+            <div className="border-b border-[var(--primary)]/20 bg-[var(--primary)] px-6 py-5 text-white">
+              <div className="flex items-center gap-3">
+                <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-white/15 ring-1 ring-white/25">
+                  <HugeIcon name="book" size={18} />
+                </span>
+                <div>
+                  <h2 className="m-0 text-base font-extrabold tracking-tight">
+                    Academic Term
+                  </h2>
+                  <p className="mt-1 text-[12px] font-medium text-white/75">
+                    Library hours window · 3h requirement per term
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            <div className="space-y-4 bg-slate-50/80 p-6 md:p-7">
+              <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                <label className="mb-2 block text-[11px] font-extrabold uppercase tracking-wider text-slate-500">
+                  Term Name
+                </label>
+                <input
+                  className={settingsControlClass}
+                  value={db.settings.termName || ""}
+                  placeholder="e.g. 1st Term AY 2025-2026"
+                  onChange={(e) => updateSettings({ termName: e.target.value })}
+                />
+              </div>
+
+              <div className="grid gap-4 md:grid-cols-2">
+                <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                  <label className="mb-2 block text-[11px] font-extrabold uppercase tracking-wider text-slate-500">
+                    Term Start Date
+                  </label>
+                  <input
+                    type="date"
+                    className={`${settingsControlClass} font-semibold`}
+                    value={db.settings.termStartDate || ""}
+                    onChange={(e) =>
+                      updateSettings({ termStartDate: e.target.value })
+                    }
+                  />
+                  <p className="mt-2.5 text-[11px] text-slate-500">
+                    First day of the term.
+                  </p>
+                </div>
+                <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                  <label className="mb-2 block text-[11px] font-extrabold uppercase tracking-wider text-slate-500">
+                    Duration (months)
+                  </label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={24}
+                    className={`${settingsControlClass} font-semibold tabular-nums`}
+                    value={db.settings.termMonths ?? 4}
+                    onChange={(e) => {
+                      const n = Number(e.target.value);
+                      updateSettings({
+                        termMonths: Number.isFinite(n)
+                          ? Math.min(24, Math.max(1, Math.round(n)))
+                          : 4,
+                      });
+                    }}
+                  />
+                  <p className="mt-2.5 text-[11px] text-slate-500">
+                    How many months this term lasts (1–24).
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-3 rounded-2xl border border-[var(--primary)]/20 bg-[var(--primary)]/5 px-5 py-4">
+                <Button
+                  type="button"
+                  onClick={() => {
+                    const today = new Date();
+                    const y = today.getFullYear();
+                    const m = String(today.getMonth() + 1).padStart(2, "0");
+                    const d = String(today.getDate()).padStart(2, "0");
+                    updateSettings({ termStartDate: `${y}-${m}-${d}` });
+                  }}
+                >
+                  Start Term Today
+                </Button>
+                {db.settings.termStartDate && (db.settings.termMonths ?? 0) > 0 ? (
+                  <span className="rounded-lg bg-white px-3 py-2 text-[12px] font-bold text-[var(--primary)] ring-1 ring-[var(--primary)]/20">
+                    {formatTermLabel(db.settings)}
+                  </span>
+                ) : (
+                  <span className="text-[12px] font-medium text-slate-600">
+                    No active term window yet — set a start date and duration.
+                  </span>
+                )}
+              </div>
+            </div>
+          </Card>
+
+          {/* Display + Danger */}
+          <div className="grid gap-8 lg:grid-cols-2">
+            <Card className="!mb-0 overflow-hidden !p-0 ring-1 ring-slate-200/90">
+              <div className="border-b border-slate-200 bg-slate-100/90 px-6 py-4">
+                <h2 className="m-0 text-sm font-extrabold tracking-tight text-slate-800">
+                  Display Preferences
+                </h2>
+                <p className="mt-1 text-[12px] text-slate-500">
+                  Clock and export time format
+                </p>
+              </div>
+              <div className="bg-white p-6">
+                <div className="mb-3 text-[11px] font-extrabold uppercase tracking-wider text-slate-500">
+                  Time Format
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  {(
+                    [
+                      ["12h", "12-hour", "4:12 PM"],
+                      ["24h", "24-hour", "16:12"],
+                    ] as const
+                  ).map(([value, label, sample]) => {
+                    const active = (db.settings.timeFormat || "12h") === value;
+                    return (
+                      <button
+                        key={value}
+                        type="button"
+                        onClick={() =>
+                          updateSettings({ timeFormat: value })
+                        }
+                        className={`rounded-xl border-2 px-3.5 py-3.5 text-left transition ${
+                          active
+                            ? "border-[var(--primary)] bg-[var(--primary)] text-white shadow-sm"
+                            : "border-slate-200 bg-slate-50 text-slate-700 hover:border-slate-300 hover:bg-white"
+                        }`}
+                      >
+                        <div className="text-sm font-extrabold">{label}</div>
+                        <div
+                          className={`mt-1 text-[11px] ${
+                            active ? "text-white/75" : "text-slate-500"
+                          }`}
+                        >
+                          e.g. {sample}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            </Card>
+
+            {can("admin.factoryReset") && (
+              <Card className="!mb-0 overflow-hidden !p-0 ring-1 ring-red-200/80">
+                <div className="border-b border-red-200/80 bg-red-50 px-6 py-4">
+                  <h2 className="m-0 text-sm font-extrabold tracking-tight text-red-900">
+                    Database Management
+                  </h2>
+                  <p className="mt-1 text-[12px] text-red-800/70">
+                    Destructive actions — use with care
+                  </p>
+                </div>
+                <div className="bg-white p-6">
+                  <p className="mb-4 text-[12px] text-slate-500">
+                    Clears roster, logs, events, and settings from the connected
+                    database.
+                  </p>
+                  <Button variant="danger" onClick={factoryReset}>
+                    Reset All Data
+                  </Button>
+                </div>
+              </Card>
+            )}
           </div>
-
-          <hr className="my-5 border-slate-200/80" />
-          <SectionTitle>Display Preferences</SectionTitle>
-          <div className="mb-4" />
-          <Field label="Time Format">
-            <select
-              className={inputClass}
-              value={db.settings.timeFormat || "12h"}
-              onChange={(e) =>
-                updateSettings({
-                  timeFormat: e.target.value as "12h" | "24h",
-                })
-              }
-            >
-              <option value="12h">12-hour (e.g. 4:12:57 PM)</option>
-              <option value="24h">24-hour (e.g. 16:12:57)</option>
-            </select>
-            <small className="mt-1 text-[11px] text-slate-500">
-              Applies to the kiosk clock, scan notifications, summary tables,
-              and Excel exports. Times are still stored in 24-hour format
-              internally.
-            </small>
-          </Field>
-
-          <hr className="my-5 border-slate-200/80" />
-          <SectionTitle>Database Management</SectionTitle>
-          <div className="mb-3" />
-          <Button variant="danger" onClick={factoryReset}>
-            Reset All Data
-          </Button>
-        </Card>
+        </div>
       )}
 
-      {adminTab === "roster" && (
+      {activeAdminTab === "roster" && can("admin.roster") && (
         <>
+        {(can("admin.rosterImport") || can("admin.rosterDemo")) && (
         <Card>
           <SectionTitle>Roster Sync & Import</SectionTitle>
           <p className="mb-4 mt-2 text-[13px] text-slate-500">
@@ -990,6 +1412,8 @@ export function AdminView() {
             track.
           </p>
           <div className="flex flex-wrap gap-2.5">
+            {can("admin.rosterImport") && (
+              <>
             <button
               type="button"
               onClick={() => openImportDialog("student")}
@@ -1004,12 +1428,18 @@ export function AdminView() {
             >
               Import Faculty/Admin
             </button>
+              </>
+            )}
+            {can("admin.rosterDemo") && (
             <Button variant="secondary" onClick={loadDemoData}>
               Inject Demo Data
             </Button>
+            )}
           </div>
         </Card>
+        )}
 
+      {can("admin.rosterRegister") && (
       <Card>
         <SectionTitle>Registration Module</SectionTitle>
         <p className="mb-5 mt-2 text-[13px] text-slate-500">
@@ -1156,6 +1586,7 @@ export function AdminView() {
           <Button onClick={handleRegister}>Enrollment</Button>
         </div>
       </Card>
+      )}
 
       <Card>
         <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
@@ -1209,6 +1640,7 @@ export function AdminView() {
                             alt=""
                             className="h-9 w-9 rounded-full border border-slate-200 object-cover"
                           />
+                          {can("admin.rosterPhotos") && (
                           <button
                             type="button"
                             className="absolute -right-1 -top-1 rounded-full bg-red-500 px-1 text-[8px] text-white"
@@ -1216,8 +1648,9 @@ export function AdminView() {
                           >
                             ×
                           </button>
+                          )}
                         </div>
-                      ) : (
+                      ) : can("admin.rosterPhotos") ? (
                         <label className="cursor-pointer rounded-lg border border-slate-300 bg-slate-100 px-2 py-1 text-[11px] font-semibold text-slate-700">
                           Add Photo
                           <input
@@ -1229,6 +1662,8 @@ export function AdminView() {
                             }
                           />
                         </label>
+                      ) : (
+                        <span className="text-[11px] text-slate-400">—</span>
                       )}
                     </td>
                     <td className="border-b border-slate-200 px-4 py-3 text-sm font-semibold">
@@ -1280,7 +1715,7 @@ export function AdminView() {
         </>
       )}
 
-      {adminTab === "ids" && (
+      {activeAdminTab === "ids" && can("admin.ids") && (
       <Card>
         <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
           <SectionTitle>ID Card Generator Gallery</SectionTitle>
@@ -1421,6 +1856,7 @@ export function AdminView() {
           </div>,
           document.body
         )}
+      </div>
 
       {importDialogOpen && (
         <div className="fixed inset-0 z-[1000] flex items-center justify-center bg-slate-900/45 backdrop-blur-sm">

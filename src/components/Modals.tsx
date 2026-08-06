@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useAttendance } from "@/context/AttendanceContext";
+import { useAuth } from "@/context/AuthContext";
 import {
   isSuccessVoiceEnabled,
   setSuccessVoiceEnabled,
@@ -156,7 +157,8 @@ export function ScanNotificationModal() {
 
 export function StatusModal() {
   const { statusModal, closeStatusModal, saveStatusOverride } = useAttendance();
-  if (!statusModal) return null;
+  const { can } = useAuth();
+  if (!statusModal || !can("summary.statusOverride")) return null;
 
   return (
     <div className="fixed inset-0 z-[100] flex items-center justify-center bg-slate-900/45 backdrop-blur-sm">
