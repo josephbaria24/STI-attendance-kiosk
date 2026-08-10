@@ -15,9 +15,44 @@ function nowHms(d = new Date()) {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`;
 }
 
+function isAppleTouchDevice() {
+  if (typeof navigator === "undefined") return false;
+  const ua = navigator.userAgent || "";
+  if (/iPad|iPhone|iPod/i.test(ua)) return true;
+  // iPadOS desktop UA
+  return navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1;
+}
+
+function patchScannerVideo(rootId: string) {
+  const root = document.getElementById(rootId);
+  if (!root) return;
+  const videos = root.querySelectorAll("video");
+  videos.forEach((video) => {
+    video.setAttribute("playsinline", "true");
+    video.setAttribute("webkit-playsinline", "true");
+    video.setAttribute("autoplay", "true");
+    video.setAttribute("muted", "true");
+    video.muted = true;
+    video.playsInline = true;
+    video.autoplay = true;
+    // Avoid iOS hijacking into native fullscreen player
+    try {
+      (video as HTMLVideoElement & { disablePictureInPicture?: boolean }).disablePictureInPicture =
+        true;
+    } catch {
+      /* ignore */
+    }
+    video.style.objectFit = "cover";
+    video.style.width = "100%";
+    video.style.height = "100%";
+    void video.play().catch(() => undefined);
+  });
+}
+
 export function ScannerView() {
   const {
     db,
+    view,
     scanMode,
     setScanMode,
     classSubject,
@@ -51,6 +86,8 @@ export function ScannerView() {
   const manualWrapRef = useRef<HTMLDivElement | null>(null);
   const scannerRef = useRef<Html5Qrcode | null>(null);
   const runningRef = useRef(false);
+  const wantRunningRef = useRef(false);
+  const startingRef = useRef(false);
   const lastScan = useRef({ data: "", time: 0 });
   const processRef = useRef(processAttendanceRecord);
   const isOpen = db.settings.thresholdMode === "open";
@@ -183,38 +220,48 @@ export function ScannerView() {
     setManualOpen(false);
   }
 
-  const stopScanner = useCallback(async () => {
-    const scanner = scannerRef.current;
-    if (!scanner) {
+  const stopScanner = useCallback(
+    async (opts?: { userInitiated?: boolean }) => {
+      if (opts?.userInitiated) {
+        wantRunningRef.current = false;
+      }
+
+      const scanner = scannerRef.current;
+      if (!scanner) {
+        runningRef.current = false;
+        setRunning(false);
+        return;
+      }
+
+      try {
+        // html5-qrcode owns #reader children — stop before React touches that node
+        if (runningRef.current) {
+          await scanner.stop();
+        }
+      } catch {
+        /* already stopped */
+      }
+
+      try {
+        scanner.clear();
+      } catch {
+        /* ignore */
+      }
+
+      scannerRef.current = null;
       runningRef.current = false;
       setRunning(false);
-      return;
-    }
-
-    try {
-      // html5-qrcode owns #reader children — stop before React touches that node
-      if (runningRef.current) {
-        await scanner.stop();
+      if (opts?.userInitiated) {
+        logConsole("Scanner Offline.");
       }
-    } catch {
-      /* already stopped */
-    }
-
-    try {
-      scanner.clear();
-    } catch {
-      /* ignore */
-    }
-
-    scannerRef.current = null;
-    runningRef.current = false;
-    setRunning(false);
-    logConsole("Scanner Offline.");
-  }, [logConsole]);
+    },
+    [logConsole],
+  );
 
   useEffect(() => {
     return () => {
       const scanner = scannerRef.current;
+      wantRunningRef.current = false;
       if (!scanner) return;
       runningRef.current = false;
       scannerRef.current = null;
@@ -299,7 +346,13 @@ export function ScannerView() {
   }, []);
 
   async function startScanner() {
-    if (runningRef.current) return;
+    if (startingRef.current) return;
+    if (runningRef.current && scannerRef.current) {
+      patchScannerVideo(readerDomId);
+      return;
+    }
+
+    wantRunningRef.current = true;
     resumeAudio();
 
     if (
@@ -329,57 +382,97 @@ export function ScannerView() {
       return;
     }
 
-    // Ensure previous instance is fully released
+    startingRef.current = true;
+
+    // Ensure previous instance is fully released (keep wantRunning)
     if (scannerRef.current) {
       await stopScanner();
+      wantRunningRef.current = true;
     }
 
+    const apple = isAppleTouchDevice();
+
+    const dynamicQrBox = (
+      viewfinderWidth: number,
+      viewfinderHeight: number
+    ) => {
+      const minimalBound = Math.min(viewfinderWidth, viewfinderHeight);
+      const activeBoxEdge = Math.floor(minimalBound * (apple ? 0.72 : 0.68));
+      return { width: activeBoxEdge, height: activeBoxEdge };
+    };
+
+    const scanConfig = apple
+      ? { fps: 8, qrbox: dynamicQrBox }
+      : { fps: 20, qrbox: dynamicQrBox, aspectRatio: 1.0 };
+
+    const cameraConfigs: Array<string | MediaTrackConstraints> = [];
+    if (cameraId) {
+      cameraConfigs.push({ deviceId: { exact: cameraId } });
+      cameraConfigs.push({ deviceId: cameraId });
+    }
+    cameraConfigs.push({ facingMode: { ideal: "environment" } });
+    cameraConfigs.push({ facingMode: "environment" });
+    cameraConfigs.push({ facingMode: "user" });
+
+    let started = false;
+    let lastError: unknown;
+
     try {
-      const scanner = new Html5Qrcode(readerDomId);
-      scannerRef.current = scanner;
-      const config = cameraId
-        ? { deviceId: { exact: cameraId } }
-        : { facingMode: "environment" };
+      for (const config of cameraConfigs) {
+        if (!wantRunningRef.current) break;
+        try {
+          const scanner = new Html5Qrcode(readerDomId);
+          scannerRef.current = scanner;
+          await scanner.start(
+            config,
+            scanConfig,
+            (text) => {
+              const now = Date.now();
+              if (
+                text === lastScan.current.data &&
+                now - lastScan.current.time < 2500
+              )
+                return;
+              lastScan.current = { data: text, time: now };
 
-      const dynamicQrBox = (
-        viewfinderWidth: number,
-        viewfinderHeight: number
-      ) => {
-        const minimalBound = Math.min(viewfinderWidth, viewfinderHeight);
-        const activeBoxEdge = Math.floor(minimalBound * 0.68);
-        return { width: activeBoxEdge, height: activeBoxEdge };
-      };
-
-      await scanner.start(
-        config,
-        { fps: 20, qrbox: dynamicQrBox, aspectRatio: 1.0 },
-        (text) => {
-          const now = Date.now();
-          if (
-            text === lastScan.current.data &&
-            now - lastScan.current.time < 2500
-          )
-            return;
-          lastScan.current = { data: text, time: now };
-
-          let id = text.trim();
+              let id = text.trim();
+              try {
+                const parsed = JSON.parse(text) as {
+                  studentId?: string;
+                  id?: string;
+                };
+                if (parsed.studentId) id = parsed.studentId;
+                else if (parsed.id) id = parsed.id;
+              } catch {
+                /* plain id */
+              }
+              processRef.current(id);
+            },
+            () => undefined
+          );
+          started = true;
+          break;
+        } catch (err) {
+          lastError = err;
           try {
-            const parsed = JSON.parse(text) as {
-              studentId?: string;
-              id?: string;
-            };
-            if (parsed.studentId) id = parsed.studentId;
-            else if (parsed.id) id = parsed.id;
+            scannerRef.current?.clear();
           } catch {
-            /* plain id */
+            /* ignore */
           }
-          processRef.current(id);
-        },
-        () => undefined
-      );
+          scannerRef.current = null;
+        }
+      }
+
+      if (!started || !wantRunningRef.current) {
+        throw lastError || new Error("Camera start failed");
+      }
 
       runningRef.current = true;
       setRunning(true);
+      patchScannerVideo(readerDomId);
+      // iOS sometimes mounts video a tick later
+      window.setTimeout(() => patchScannerVideo(readerDomId), 120);
+      window.setTimeout(() => patchScannerVideo(readerDomId), 400);
       logConsole("Scanner Online.");
       setTimeout(refreshCameras, 1000);
     } catch {
@@ -392,11 +485,82 @@ export function ScannerView() {
         "Please allow camera access inside browser/app configurations.",
         "error"
       );
+    } finally {
+      startingRef.current = false;
     }
   }
 
   const startScannerRef = useRef(startScanner);
   startScannerRef.current = startScanner;
+
+  // Auto-start when entering Scanning Kiosk (avoids extra tap on iOS)
+  useEffect(() => {
+    if (view !== "scanner") {
+      wantRunningRef.current = false;
+      return;
+    }
+    wantRunningRef.current = true;
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      if (cancelled) return;
+      void startScannerRef.current();
+    }, 280);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [view]);
+
+  // iOS Safari pauses/blacks the camera when the tab backgrounds — resume or restart
+  useEffect(() => {
+    let reviveTimer: number | undefined;
+
+    async function reviveCamera() {
+      if (document.hidden || view !== "scanner" || !wantRunningRef.current) {
+        return;
+      }
+      if (startingRef.current) return;
+
+      const video = document
+        .getElementById(readerDomId)
+        ?.querySelector("video") as HTMLVideoElement | null;
+
+      if (runningRef.current && video) {
+        patchScannerVideo(readerDomId);
+        if (!video.paused && video.readyState >= 2) return;
+        try {
+          await video.play();
+          if (!video.paused && video.readyState >= 2) return;
+        } catch {
+          /* fall through to full restart */
+        }
+      }
+
+      await stopScanner();
+      wantRunningRef.current = true;
+      window.setTimeout(() => {
+        if (wantRunningRef.current && view === "scanner") {
+          void startScannerRef.current();
+        }
+      }, 200);
+    }
+
+    function onVisibility() {
+      if (document.hidden) return;
+      window.clearTimeout(reviveTimer);
+      reviveTimer = window.setTimeout(() => {
+        void reviveCamera();
+      }, 350);
+    }
+
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("pageshow", onVisibility);
+    return () => {
+      window.clearTimeout(reviveTimer);
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("pageshow", onVisibility);
+    };
+  }, [view, readerDomId, stopScanner]);
 
   useEffect(() => {
     (
@@ -405,11 +569,12 @@ export function ScannerView() {
         __attendxStartScanner?: () => void;
       }
     ).__attendxStopScanner = () => {
-      void stopScanner();
+      void stopScanner({ userInitiated: true });
     };
     (
       window as unknown as { __attendxStartScanner?: () => void }
     ).__attendxStartScanner = () => {
+      wantRunningRef.current = true;
       void startScannerRef.current();
     };
     return () => {
@@ -893,7 +1058,10 @@ export function ScannerView() {
               Start Scanner
             </Button>
             {running && (
-              <Button variant="danger" onClick={() => void stopScanner()}>
+              <Button
+                variant="danger"
+                onClick={() => void stopScanner({ userInitiated: true })}
+              >
                 <HugeIcon name="stop" size={16} className="icon-pop" />
                 Stop
               </Button>

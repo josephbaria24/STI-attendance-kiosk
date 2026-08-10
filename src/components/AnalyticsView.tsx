@@ -2,7 +2,6 @@
 
 import { useEffect, useMemo, useState } from "react";
 import * as XLSX from "xlsx";
-import { Bar, BarChart, CartesianGrid, Pie, PieChart, XAxis, YAxis } from "recharts";
 import { useAttendance } from "@/context/AttendanceContext";
 import { useAuth } from "@/context/AuthContext";
 import {
@@ -17,8 +16,12 @@ import {
   parseTimeToSeconds,
 } from "@/lib/utils";
 import { Badge, Button, Card, Field, PageHeader, SectionTitle, TableShell, inputClass } from "./ui";
-import { ChartContainer, ChartTooltip, ChartTooltipContent } from "./ui/chart";
 import { HugeIcon } from "./icons";
+import {
+  RoleDonutChart,
+  ScansChart,
+  TopHoursChart,
+} from "./analytics/VisxCharts";
 
 const analyticsColumnWidths = ["12%", "20%", "9%", "13%", "10%", "10%", "14%", "12%"];
 const analyticsColumnWidthsGate = ["12%", "22%", "10%", "14%", "12%", "13%", "17%"];
@@ -176,12 +179,12 @@ export function AnalyticsView() {
         .sort((a, b) => parseFloat(b.decimalHrs) - parseFloat(a.decimalHrs))
         .slice(0, 40)
         .map((m) => ({
-          name: m.name.length > 22 ? `${m.name.slice(0, 22)}...` : m.name,
+          id: m.id,
+          name: m.name,
           hours: Number.parseFloat(m.decimalHrs),
         })),
     [metrics]
   );
-  const topHoursChartHeight = Math.max(320, topHours.length * 38);
 
   const scanTotals = useMemo(() => {
     const ins = metrics.reduce((sum, m) => sum + m.ins, 0);
@@ -425,7 +428,7 @@ export function AnalyticsView() {
           Charts update from current filter + sort context.
         </div>
         <div className="grid gap-4 lg:grid-cols-5">
-          <div className="rounded-xl border border-slate-200/80 bg-white p-3.5 lg:col-span-3">
+          <div className="rounded-2xl border border-slate-200/80 bg-gradient-to-b from-white to-slate-50/80 p-3.5 lg:col-span-3">
             <div className="mb-2 flex items-center justify-between gap-2">
               <div className="text-sm font-semibold text-slate-700">
                 Top Accumulated Hours
@@ -434,85 +437,24 @@ export function AnalyticsView() {
                 {topHours.length} shown · scroll
               </div>
             </div>
-            <div className="h-[420px] overflow-y-auto overflow-x-hidden rounded-lg border border-slate-100 bg-slate-50/40 pr-1">
-              <ChartContainer
-                config={{ hours: { label: "Hours", color: "#0f766e" } }}
-                className="w-full"
-                style={{ height: topHoursChartHeight, minHeight: 320 }}
-              >
-                <BarChart
-                  data={topHours}
-                  layout="vertical"
-                  margin={{ left: 8, right: 12, top: 8, bottom: 8 }}
-                >
-                  <CartesianGrid horizontal={false} />
-                  <XAxis type="number" tickLine={false} axisLine={false} />
-                  <YAxis
-                    type="category"
-                    dataKey="name"
-                    width={148}
-                    tickLine={false}
-                    axisLine={false}
-                    tick={{ fontSize: 11 }}
-                    interval={0}
-                  />
-                  <ChartTooltip content={<ChartTooltipContent />} />
-                  <Bar
-                    dataKey="hours"
-                    radius={[0, 6, 6, 0]}
-                    className="color-hours"
-                  />
-                </BarChart>
-              </ChartContainer>
+            <div className="h-[420px] overflow-y-auto overflow-x-hidden rounded-xl border border-slate-100 bg-white/70 pr-1">
+              <TopHoursChart data={topHours} />
             </div>
           </div>
 
           <div className="flex flex-col gap-4 lg:col-span-2">
-            <div className="rounded-xl border border-slate-200/80 bg-white p-3.5">
+            <div className="rounded-2xl border border-slate-200/80 bg-gradient-to-b from-white to-sky-50/40 p-3.5">
               <div className="mb-2 text-sm font-semibold text-slate-700">
                 Total Scans (In/Out)
               </div>
-              <ChartContainer
-                config={{ total: { label: "Total", color: "#0284c7" } }}
-                className="h-[140px] w-full"
-              >
-                <BarChart data={scanTotals} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
-                  <CartesianGrid vertical={false} />
-                  <XAxis dataKey="label" tickLine={false} axisLine={false} />
-                  <YAxis tickLine={false} axisLine={false} width={28} />
-                  <ChartTooltip content={<ChartTooltipContent />} />
-                  <Bar
-                    dataKey="total"
-                    radius={[6, 6, 0, 0]}
-                    className="color-total"
-                  />
-                </BarChart>
-              </ChartContainer>
+              <ScansChart data={scanTotals} />
             </div>
 
-            <div className="rounded-xl border border-slate-200/80 bg-white p-3.5">
+            <div className="rounded-2xl border border-slate-200/80 bg-gradient-to-b from-white to-teal-50/40 p-3.5">
               <div className="mb-2 text-sm font-semibold text-slate-700">
                 Role Distribution
               </div>
-              <ChartContainer
-                config={{
-                  count: { label: "Members", color: "#0f766e" },
-                }}
-                className="h-[140px] w-full"
-              >
-                <PieChart margin={{ top: 0, right: 0, left: 0, bottom: 0 }}>
-                  <ChartTooltip content={<ChartTooltipContent />} />
-                  <Pie
-                    data={roleBreakdown}
-                    dataKey="count"
-                    nameKey="role"
-                    innerRadius={28}
-                    outerRadius={48}
-                    className="color-count"
-                    label
-                  />
-                </PieChart>
-              </ChartContainer>
+              <RoleDonutChart data={roleBreakdown} />
             </div>
           </div>
         </div>

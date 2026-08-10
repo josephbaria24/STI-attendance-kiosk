@@ -193,8 +193,12 @@ button:hover .icon-pop {
   letter-spacing: -0.03em;
 }
 
-#reader video {
+#reader video,
+[id^="qr-reader"] video {
+  width: 100% !important;
+  max-height: min(70vh, 520px) !important;
   object-fit: cover !important;
+  background: #0f172a;
 }
 
 .print-only {
