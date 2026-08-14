@@ -22,14 +22,13 @@ function isMobileBrowser() {
   return navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1;
 }
 
-function patchScannerVideo(rootId: string) {
+/** Keep iOS Safari from jumping into native fullscreen (then a black preview). */
+function keepInlinePlayback(rootId: string) {
   const root = document.getElementById(rootId);
   if (!root) return;
-  const videos = root.querySelectorAll("video");
-  videos.forEach((video) => {
+  root.querySelectorAll("video").forEach((video) => {
     video.setAttribute("playsinline", "true");
     video.setAttribute("webkit-playsinline", "true");
-    video.setAttribute("autoplay", "true");
     video.setAttribute("muted", "true");
     video.muted = true;
     video.playsInline = true;
@@ -40,10 +39,11 @@ function patchScannerVideo(rootId: string) {
     } catch {
       /* ignore */
     }
-    video.style.objectFit = "cover";
-    video.style.width = "100%";
-    video.style.height = "100%";
-    void video.play().catch(() => undefined);
+    // Do not call play() if already playing — iOS 17+ treats a second play() as
+    // native fullscreen, then blacks the inline preview after ~1–2s.
+    if (video.paused) {
+      void video.play().catch(() => undefined);
+    }
   });
 }
 
@@ -84,8 +84,7 @@ function videoStreamAlive(rootId: string): boolean {
   if (!video) return false;
   const stream = video.srcObject;
   if (!(stream instanceof MediaStream)) return false;
-  const live = stream.getVideoTracks().some((t) => t.readyState === "live");
-  return live && video.readyState >= 2;
+  return stream.getVideoTracks().some((t) => t.readyState === "live");
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
@@ -147,6 +146,7 @@ export function ScannerView() {
   const startingRef = useRef(false);
   const lastReviveAtRef = useRef(0);
   const lastScan = useRef({ data: "", time: 0 });
+  const inlineObserverRef = useRef<MutationObserver | null>(null);
   const processRef = useRef(processAttendanceRecord);
   const isOpen = db.settings.thresholdMode === "open";
   const [clockNow, setClockNow] = useState(() => new Date());
@@ -310,6 +310,8 @@ export function ScannerView() {
       scannerRef.current = null;
       runningRef.current = false;
       setRunning(false);
+      inlineObserverRef.current?.disconnect();
+      inlineObserverRef.current = null;
       if (opts?.userInitiated) {
         logConsole("Scanner Offline.");
       }
@@ -342,6 +344,9 @@ export function ScannerView() {
   }, [readerDomId]);
 
   async function refreshCameras() {
+    // Html5Qrcode.getCameras() calls getUserMedia on iOS and will steal/black
+    // the live preview if we enumerate while scanning.
+    if (runningRef.current || startingRef.current || scannerRef.current) return;
     try {
       const list = await Html5Qrcode.getCameras();
       setCameras(
@@ -354,10 +359,6 @@ export function ScannerView() {
       /* camera list optional until permission */
     }
   }
-
-  useEffect(() => {
-    refreshCameras();
-  }, []);
 
   useEffect(() => {
     let mounted = true;
@@ -407,8 +408,11 @@ export function ScannerView() {
 
   async function startScanner() {
     if (startingRef.current) return;
-    if (runningRef.current && scannerRef.current && videoStreamAlive(readerDomId)) {
-      patchScannerVideo(readerDomId);
+    // Never tear down a live session — a second getUserMedia is what blacks iOS after ~2s.
+    if (scannerRef.current && (runningRef.current || videoStreamAlive(readerDomId))) {
+      keepInlinePlayback(readerDomId);
+      runningRef.current = true;
+      setRunning(true);
       return;
     }
 
@@ -467,19 +471,18 @@ export function ScannerView() {
       return { width: activeBoxEdge, height: activeBoxEdge };
     };
 
-    // Lower FPS + no forced aspectRatio on mobile (both are hang/black-screen triggers)
+    // iOS: skip qrbox overlays (they reflow the video and trigger the black preview).
     const scanConfig = mobile
-      ? { fps: 10, qrbox: dynamicQrBox }
+      ? { fps: 8 }
       : { fps: 15, qrbox: dynamicQrBox };
 
-    // Prefer one good constraint; only fall back once if needed
+    // One constraint only — a fallback start is a second getUserMedia (iOS black).
     const cameraConfigs: Array<string | MediaTrackConstraints> = [];
     if (cameraId) {
       cameraConfigs.push({ deviceId: { ideal: cameraId } });
     } else {
       cameraConfigs.push({ facingMode: { ideal: "environment" } });
     }
-    cameraConfigs.push({ facingMode: "environment" });
 
     let started = false;
     let lastError: unknown;
@@ -549,10 +552,15 @@ export function ScannerView() {
 
       runningRef.current = true;
       setRunning(true);
-      patchScannerVideo(readerDomId);
-      window.setTimeout(() => patchScannerVideo(readerDomId), 200);
+      keepInlinePlayback(readerDomId);
+      const root = document.getElementById(readerDomId);
+      if (root) {
+        inlineObserverRef.current?.disconnect();
+        const mo = new MutationObserver(() => keepInlinePlayback(readerDomId));
+        mo.observe(root, { childList: true, subtree: true });
+        inlineObserverRef.current = mo;
+      }
       logConsole("Scanner Online.");
-      window.setTimeout(refreshCameras, 1000);
     } catch {
       scannerRef.current = null;
       runningRef.current = false;
@@ -572,7 +580,7 @@ export function ScannerView() {
   const startScannerRef = useRef(startScanner);
   startScannerRef.current = startScanner;
 
-  // Auto-start when entering Scanning Kiosk
+  // Auto-start when entering Scanning Kiosk (one shot — extra starts black iOS)
   useEffect(() => {
     if (view !== "scanner") {
       wantRunningRef.current = false;
@@ -582,14 +590,16 @@ export function ScannerView() {
     let cancelled = false;
     const tryStart = () => {
       if (cancelled || !wantRunningRef.current) return;
+      if (scannerRef.current || startingRef.current) return;
       void startScannerRef.current();
     };
-    const timer = window.setTimeout(tryStart, 450);
-    const retry = window.setTimeout(tryStart, 1100);
+    const timer = window.setTimeout(tryStart, 500);
+    // Only if the pane was still hidden on the first try
+    const late = window.setTimeout(tryStart, 2200);
     return () => {
       cancelled = true;
       window.clearTimeout(timer);
-      window.clearTimeout(retry);
+      window.clearTimeout(late);
     };
   }, [view]);
 
@@ -606,25 +616,10 @@ export function ScannerView() {
       const now = Date.now();
       if (now - lastReviveAtRef.current < 2500) return;
 
-      // Healthy stream → just nudge play(); do NOT full restart
-      if (runningRef.current && videoStreamAlive(readerDomId)) {
-        patchScannerVideo(readerDomId);
+      // Healthy stream → keep inline; do NOT full restart (blacks iOS)
+      if (scannerRef.current && videoStreamAlive(readerDomId)) {
+        keepInlinePlayback(readerDomId);
         return;
-      }
-
-      const video = document
-        .getElementById(readerDomId)
-        ?.querySelector("video") as HTMLVideoElement | null;
-      if (runningRef.current && video) {
-        try {
-          await video.play();
-          if (videoStreamAlive(readerDomId)) {
-            patchScannerVideo(readerDomId);
-            return;
-          }
-        } catch {
-          /* need full restart */
-        }
       }
 
       lastReviveAtRef.current = now;
@@ -1129,6 +1124,7 @@ export function ScannerView() {
             <select
               className={inputClass}
               value={cameraId}
+              onFocus={() => void refreshCameras()}
               onChange={(e) => setCameraId(e.target.value)}
             >
               <option value="">Auto-Detect (Rear Camera)</option>

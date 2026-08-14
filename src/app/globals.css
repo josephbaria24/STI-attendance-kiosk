@@ -196,9 +196,11 @@ button:hover .icon-pop {
 #reader video,
 [id^="qr-reader"] video {
   width: 100% !important;
-  max-height: min(70vh, 520px) !important;
+  height: auto !important;
   object-fit: cover !important;
   background: #0f172a;
+  /* Keep iOS from promoting the preview into native fullscreen */
+  -webkit-playsinline: true;
 }
 
 .print-only {
