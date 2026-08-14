@@ -22,6 +22,72 @@ function isMobileBrowser() {
   return navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1;
 }
 
+function isAppleTouchDevice() {
+  if (typeof navigator === "undefined") return false;
+  const ua = navigator.userAgent || "";
+  if (/iPad|iPhone|iPod/i.test(ua)) return true;
+  return navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1;
+}
+
+function formatCameraError(err: unknown): string {
+  if (err == null) return "unknown error";
+  if (typeof err === "string") return err.trim() || "unknown error";
+  if (err instanceof Error) {
+    const extra = err as Error & {
+      code?: string | number;
+      constraint?: string;
+    };
+    const parts = [
+      extra.name && extra.name !== "Error" ? extra.name : "",
+      extra.message,
+      extra.code != null && extra.code !== extra.name ? `code=${extra.code}` : "",
+      extra.constraint ? `constraint=${extra.constraint}` : "",
+    ].filter(Boolean);
+    return parts.join(" · ") || err.toString();
+  }
+  if (typeof err === "object") {
+    const o = err as Record<string, unknown>;
+    const parts = [o.name, o.message, o.code, o.constraint]
+      .filter((v) => v != null && String(v).trim() !== "")
+      .map(String);
+    if (parts.length) return parts.join(" · ");
+    try {
+      return JSON.stringify(err);
+    } catch {
+      return String(err);
+    }
+  }
+  return String(err);
+}
+
+function describeCameraConfig(config: string | MediaTrackConstraints): string {
+  if (typeof config === "string") {
+    return `deviceId=${config.length > 18 ? `${config.slice(0, 18)}…` : config}`;
+  }
+  if (config.facingMode != null) {
+    return `facingMode=${JSON.stringify(config.facingMode)}`;
+  }
+  if (config.deviceId != null) {
+    return `deviceId=${JSON.stringify(config.deviceId)}`;
+  }
+  try {
+    return JSON.stringify(config);
+  } catch {
+    return "custom constraints";
+  }
+}
+
+function isGestureBlocked(err: unknown): boolean {
+  const msg = formatCameraError(err).toLowerCase();
+  return (
+    msg.includes("notallowed") ||
+    msg.includes("not allowed") ||
+    msg.includes("play()") ||
+    msg.includes("user denied") ||
+    msg.includes("permission")
+  );
+}
+
 /** Keep iOS Safari from jumping into native fullscreen (then a black preview). */
 function keepInlinePlayback(rootId: string) {
   const root = document.getElementById(rootId);
@@ -406,7 +472,7 @@ export function ScannerView() {
     };
   }, []);
 
-  async function startScanner() {
+  async function startScanner(opts?: { silent?: boolean }) {
     if (startingRef.current) return;
     // Never tear down a live session — a second getUserMedia is what blacks iOS after ~2s.
     if (scannerRef.current && (runningRef.current || videoStreamAlive(readerDomId))) {
@@ -425,11 +491,13 @@ export function ScannerView() {
       location.hostname !== "localhost"
     ) {
       logConsole("Scanner blocked: HTTPS required by browser camera policy.");
-      showToast(
-        "Secure Context Required",
-        "Camera access needs HTTPS in production (or localhost in development).",
-        "error"
-      );
+      if (!opts?.silent) {
+        showToast(
+          "Secure Context Required",
+          "Camera access needs HTTPS in production (or localhost in development).",
+          "error"
+        );
+      }
       return;
     }
 
@@ -438,29 +506,31 @@ export function ScannerView() {
       (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia)
     ) {
       logConsole("Scanner blocked: mediaDevices API unavailable.");
-      showToast(
-        "Camera Not Supported",
-        "This browser does not expose camera APIs required for scanning.",
-        "error"
-      );
+      if (!opts?.silent) {
+        showToast(
+          "Camera Not Supported",
+          "This browser does not expose camera APIs required for scanning.",
+          "error"
+        );
+      }
       return;
     }
 
-    // Don't start while the scanner pane is still display:none (mobile freeze risk)
     const host = document.getElementById("kiosk-scanner-section");
     if (!host || host.getClientRects().length === 0) {
+      logConsole("Scanner start skipped: camera pane is not visible yet.");
       return;
     }
 
     startingRef.current = true;
 
-    // Always fully release before a new start — prevents Android camera lock
-    await stopScanner();
-    wantRunningRef.current = true;
-    // Brief yield so the OS can free the camera hardware
-    await new Promise((r) => window.setTimeout(r, 180));
+    if (scannerRef.current) {
+      await stopScanner();
+      wantRunningRef.current = true;
+    }
 
     const mobile = isMobileBrowser();
+    const apple = isAppleTouchDevice();
 
     const dynamicQrBox = (
       viewfinderWidth: number,
@@ -471,17 +541,19 @@ export function ScannerView() {
       return { width: activeBoxEdge, height: activeBoxEdge };
     };
 
-    // iOS: skip qrbox overlays (they reflow the video and trigger the black preview).
-    const scanConfig = mobile
+    const scanConfig = apple
       ? { fps: 8 }
-      : { fps: 15, qrbox: dynamicQrBox };
+      : { fps: mobile ? 10 : 15, qrbox: dynamicQrBox };
 
-    // One constraint only — a fallback start is a second getUserMedia (iOS black).
+    // html5-qrcode expects facingMode as a string, not { ideal: ... }.
     const cameraConfigs: Array<string | MediaTrackConstraints> = [];
     if (cameraId) {
-      cameraConfigs.push({ deviceId: { ideal: cameraId } });
-    } else {
-      cameraConfigs.push({ facingMode: { ideal: "environment" } });
+      cameraConfigs.push({ deviceId: { exact: cameraId } });
+      cameraConfigs.push(cameraId);
+    }
+    cameraConfigs.push({ facingMode: "environment" });
+    if (!apple) {
+      cameraConfigs.push({ facingMode: "user" });
     }
 
     let started = false;
@@ -490,45 +562,43 @@ export function ScannerView() {
     try {
       for (const config of cameraConfigs) {
         if (!wantRunningRef.current) break;
-        releaseReaderStreams(readerDomId);
         try {
           const scanner = new Html5Qrcode(readerDomId);
           scannerRef.current = scanner;
-          await withTimeout(
-            scanner.start(
-              config,
-              scanConfig,
-              (text) => {
-                const now = Date.now();
-                if (
-                  text === lastScan.current.data &&
-                  now - lastScan.current.time < 2500
-                )
-                  return;
-                lastScan.current = { data: text, time: now };
+          await scanner.start(
+            config,
+            scanConfig,
+            (text) => {
+              const now = Date.now();
+              if (
+                text === lastScan.current.data &&
+                now - lastScan.current.time < 2500
+              )
+                return;
+              lastScan.current = { data: text, time: now };
 
-                let id = text.trim();
-                try {
-                  const parsed = JSON.parse(text) as {
-                    studentId?: string;
-                    id?: string;
-                  };
-                  if (parsed.studentId) id = parsed.studentId;
-                  else if (parsed.id) id = parsed.id;
-                } catch {
-                  /* plain id */
-                }
-                processRef.current(id);
-              },
-              () => undefined
-            ),
-            12000,
-            "scanner.start",
+              let id = text.trim();
+              try {
+                const parsed = JSON.parse(text) as {
+                  studentId?: string;
+                  id?: string;
+                };
+                if (parsed.studentId) id = parsed.studentId;
+                else if (parsed.id) id = parsed.id;
+              } catch {
+                /* plain id */
+              }
+              processRef.current(id);
+            },
+            () => undefined
           );
           started = true;
           break;
         } catch (err) {
           lastError = err;
+          logConsole(
+            `Camera start failed (${describeCameraConfig(config)}): ${formatCameraError(err)}`,
+          );
           try {
             await scannerRef.current?.stop();
           } catch {
@@ -539,11 +609,16 @@ export function ScannerView() {
           } catch {
             /* ignore */
           }
-          releaseReaderStreams(readerDomId);
           scannerRef.current = null;
-          // Let Android release the device before the next attempt
-          await new Promise((r) => window.setTimeout(r, 250));
+          if (videoStreamAlive(readerDomId)) {
+            started = true;
+            break;
+          }
         }
+      }
+
+      if (!started && videoStreamAlive(readerDomId)) {
+        started = true;
       }
 
       if (!started || !wantRunningRef.current) {
@@ -561,17 +636,20 @@ export function ScannerView() {
         inlineObserverRef.current = mo;
       }
       logConsole("Scanner Online.");
-    } catch {
+    } catch (err) {
       scannerRef.current = null;
       runningRef.current = false;
       setRunning(false);
       releaseReaderStreams(readerDomId);
-      logConsole("Scanner Hardware Error: Check permissions.");
-      showToast(
-        "Camera Access Error",
-        "Please allow camera access, then tap Start Scanner again.",
-        "error"
-      );
+      const detail = formatCameraError(err);
+      logConsole(`Scanner start failed: ${detail}`);
+      if (!opts?.silent) {
+        showToast(
+          "Camera Start Failed",
+          detail.slice(0, 180) || "Tap Start Scanner to open the camera.",
+          "error"
+        );
+      }
     } finally {
       startingRef.current = false;
     }
@@ -591,7 +669,7 @@ export function ScannerView() {
     const tryStart = () => {
       if (cancelled || !wantRunningRef.current) return;
       if (scannerRef.current || startingRef.current) return;
-      void startScannerRef.current();
+      void startScannerRef.current({ silent: true });
     };
     const timer = window.setTimeout(tryStart, 500);
     // Only if the pane was still hidden on the first try
@@ -627,7 +705,7 @@ export function ScannerView() {
       wantRunningRef.current = true;
       window.setTimeout(() => {
         if (wantRunningRef.current && view === "scanner" && !document.hidden) {
-          void startScannerRef.current();
+          void startScannerRef.current({ silent: true });
         }
       }, 350);
     }

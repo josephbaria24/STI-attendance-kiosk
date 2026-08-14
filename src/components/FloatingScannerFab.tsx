@@ -66,27 +66,16 @@ export function FloatingScannerFab() {
 
   const activateScanner = useCallback(() => {
     setView("scanner");
+    // Start in this tap — iOS blocks camera play() after setTimeout.
+    (
+      window as unknown as { __attendxStartScanner?: () => void }
+    ).__attendxStartScanner?.();
     window.setTimeout(() => {
       document
         .getElementById("kiosk-scanner-section")
         ?.scrollIntoView({ behavior: "smooth", block: "start" });
-      // Let auto-start on view change own the first start; only nudge if still offline
-      window.setTimeout(() => {
-        const video = document.querySelector(
-          "#kiosk-scanner-section video",
-        ) as HTMLVideoElement | null;
-        const busy =
-          video &&
-          video.srcObject instanceof MediaStream &&
-          video.srcObject.getVideoTracks().some((t) => t.readyState === "live");
-        if (!busy) {
-          (
-            window as unknown as { __attendxStartScanner?: () => void }
-          ).__attendxStartScanner?.();
-        }
-      }, 900);
-    }, view === "scanner" ? 50 : 200);
-  }, [setView, view]);
+    }, 50);
+  }, [setView]);
 
   function onPointerDown(e: React.PointerEvent<HTMLButtonElement>) {
     e.currentTarget.setPointerCapture(e.pointerId);
