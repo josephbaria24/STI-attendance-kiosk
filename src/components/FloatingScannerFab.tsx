@@ -70,12 +70,21 @@ export function FloatingScannerFab() {
       document
         .getElementById("kiosk-scanner-section")
         ?.scrollIntoView({ behavior: "smooth", block: "start" });
+      // Let auto-start on view change own the first start; only nudge if still offline
       window.setTimeout(() => {
-        (
-          window as unknown as { __attendxStartScanner?: () => void }
-        ).__attendxStartScanner?.();
-      }, 350);
-    }, view === "scanner" ? 50 : 120);
+        const video = document
+          .querySelector("#kiosk-scanner-section video") as HTMLVideoElement | null;
+        const alive =
+          video &&
+          video.srcObject instanceof MediaStream &&
+          video.srcObject.getVideoTracks().some((t) => t.readyState === "live");
+        if (!alive) {
+          (
+            window as unknown as { __attendxStartScanner?: () => void }
+          ).__attendxStartScanner?.();
+        }
+      }, 700);
+    }, view === "scanner" ? 50 : 200);
   }, [setView, view]);
 
   function onPointerDown(e: React.PointerEvent<HTMLButtonElement>) {

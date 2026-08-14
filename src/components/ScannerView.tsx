@@ -15,11 +15,10 @@ function nowHms(d = new Date()) {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`;
 }
 
-function isAppleTouchDevice() {
+function isMobileBrowser() {
   if (typeof navigator === "undefined") return false;
   const ua = navigator.userAgent || "";
-  if (/iPad|iPhone|iPod/i.test(ua)) return true;
-  // iPadOS desktop UA
+  if (/Android|iPhone|iPad|iPod|Mobile/i.test(ua)) return true;
   return navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1;
 }
 
@@ -35,7 +34,6 @@ function patchScannerVideo(rootId: string) {
     video.muted = true;
     video.playsInline = true;
     video.autoplay = true;
-    // Avoid iOS hijacking into native fullscreen player
     try {
       (video as HTMLVideoElement & { disablePictureInPicture?: boolean }).disablePictureInPicture =
         true;
@@ -46,6 +44,65 @@ function patchScannerVideo(rootId: string) {
     video.style.width = "100%";
     video.style.height = "100%";
     void video.play().catch(() => undefined);
+  });
+}
+
+/** Force-release any leftover MediaStream tracks (Android hangs if tracks linger). */
+function releaseReaderStreams(rootId: string) {
+  const root = document.getElementById(rootId);
+  if (!root) return;
+  root.querySelectorAll("video").forEach((video) => {
+    const stream = video.srcObject;
+    if (stream instanceof MediaStream) {
+      stream.getTracks().forEach((track) => {
+        try {
+          track.stop();
+        } catch {
+          /* ignore */
+        }
+      });
+    }
+    try {
+      video.pause();
+    } catch {
+      /* ignore */
+    }
+    video.removeAttribute("src");
+    video.srcObject = null;
+    try {
+      video.load();
+    } catch {
+      /* ignore */
+    }
+  });
+}
+
+function videoStreamAlive(rootId: string): boolean {
+  const video = document
+    .getElementById(rootId)
+    ?.querySelector("video") as HTMLVideoElement | null;
+  if (!video) return false;
+  const stream = video.srcObject;
+  if (!(stream instanceof MediaStream)) return false;
+  const live = stream.getVideoTracks().some((t) => t.readyState === "live");
+  return live && video.readyState >= 2;
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = window.setTimeout(() => {
+      reject(new Error(`${label} timed out after ${ms}ms`));
+    }, ms);
+    promise.then(
+      (value) => {
+        window.clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        window.clearTimeout(timer);
+        reject(err);
+      },
+    );
   });
 }
 
@@ -88,6 +145,7 @@ export function ScannerView() {
   const runningRef = useRef(false);
   const wantRunningRef = useRef(false);
   const startingRef = useRef(false);
+  const lastReviveAtRef = useRef(0);
   const lastScan = useRef({ data: "", time: 0 });
   const processRef = useRef(processAttendanceRecord);
   const isOpen = db.settings.thresholdMode === "open";
@@ -228,18 +286,18 @@ export function ScannerView() {
 
       const scanner = scannerRef.current;
       if (!scanner) {
+        releaseReaderStreams(readerDomId);
         runningRef.current = false;
         setRunning(false);
         return;
       }
 
       try {
-        // html5-qrcode owns #reader children — stop before React touches that node
         if (runningRef.current) {
-          await scanner.stop();
+          await withTimeout(scanner.stop(), 4000, "scanner.stop");
         }
       } catch {
-        /* already stopped */
+        /* already stopped or hung — force-release below */
       }
 
       try {
@@ -248,6 +306,7 @@ export function ScannerView() {
         /* ignore */
       }
 
+      releaseReaderStreams(readerDomId);
       scannerRef.current = null;
       runningRef.current = false;
       setRunning(false);
@@ -255,17 +314,19 @@ export function ScannerView() {
         logConsole("Scanner Offline.");
       }
     },
-    [logConsole],
+    [logConsole, readerDomId],
   );
 
   useEffect(() => {
     return () => {
       const scanner = scannerRef.current;
       wantRunningRef.current = false;
-      if (!scanner) return;
+      if (!scanner) {
+        releaseReaderStreams(readerDomId);
+        return;
+      }
       runningRef.current = false;
       scannerRef.current = null;
-      // Fire-and-forget cleanup; avoid React/DOM race on unmount
       scanner
         .stop()
         .catch(() => undefined)
@@ -275,9 +336,10 @@ export function ScannerView() {
           } catch {
             /* node may already be gone */
           }
+          releaseReaderStreams(readerDomId);
         });
     };
-  }, []);
+  }, [readerDomId]);
 
   async function refreshCameras() {
     try {
@@ -336,18 +398,16 @@ export function ScannerView() {
     const onVisibility = () => {
       if (!document.hidden) void refreshScannerReadiness();
     };
-    window.addEventListener("focus", onVisibility);
     document.addEventListener("visibilitychange", onVisibility);
     return () => {
       mounted = false;
-      window.removeEventListener("focus", onVisibility);
       document.removeEventListener("visibilitychange", onVisibility);
     };
   }, []);
 
   async function startScanner() {
     if (startingRef.current) return;
-    if (runningRef.current && scannerRef.current) {
+    if (runningRef.current && scannerRef.current && videoStreamAlive(readerDomId)) {
       patchScannerVideo(readerDomId);
       return;
     }
@@ -382,37 +442,44 @@ export function ScannerView() {
       return;
     }
 
-    startingRef.current = true;
-
-    // Ensure previous instance is fully released (keep wantRunning)
-    if (scannerRef.current) {
-      await stopScanner();
-      wantRunningRef.current = true;
+    // Don't start while the scanner pane is still display:none (mobile freeze risk)
+    const host = document.getElementById("kiosk-scanner-section");
+    if (!host || host.getClientRects().length === 0) {
+      return;
     }
 
-    const apple = isAppleTouchDevice();
+    startingRef.current = true;
+
+    // Always fully release before a new start — prevents Android camera lock
+    await stopScanner();
+    wantRunningRef.current = true;
+    // Brief yield so the OS can free the camera hardware
+    await new Promise((r) => window.setTimeout(r, 180));
+
+    const mobile = isMobileBrowser();
 
     const dynamicQrBox = (
       viewfinderWidth: number,
       viewfinderHeight: number
     ) => {
       const minimalBound = Math.min(viewfinderWidth, viewfinderHeight);
-      const activeBoxEdge = Math.floor(minimalBound * (apple ? 0.72 : 0.68));
+      const activeBoxEdge = Math.floor(minimalBound * 0.7);
       return { width: activeBoxEdge, height: activeBoxEdge };
     };
 
-    const scanConfig = apple
-      ? { fps: 8, qrbox: dynamicQrBox }
-      : { fps: 20, qrbox: dynamicQrBox, aspectRatio: 1.0 };
+    // Lower FPS + no forced aspectRatio on mobile (both are hang/black-screen triggers)
+    const scanConfig = mobile
+      ? { fps: 10, qrbox: dynamicQrBox }
+      : { fps: 15, qrbox: dynamicQrBox };
 
+    // Prefer one good constraint; only fall back once if needed
     const cameraConfigs: Array<string | MediaTrackConstraints> = [];
     if (cameraId) {
-      cameraConfigs.push({ deviceId: { exact: cameraId } });
-      cameraConfigs.push({ deviceId: cameraId });
+      cameraConfigs.push({ deviceId: { ideal: cameraId } });
+    } else {
+      cameraConfigs.push({ facingMode: { ideal: "environment" } });
     }
-    cameraConfigs.push({ facingMode: { ideal: "environment" } });
     cameraConfigs.push({ facingMode: "environment" });
-    cameraConfigs.push({ facingMode: "user" });
 
     let started = false;
     let lastError: unknown;
@@ -420,46 +487,59 @@ export function ScannerView() {
     try {
       for (const config of cameraConfigs) {
         if (!wantRunningRef.current) break;
+        releaseReaderStreams(readerDomId);
         try {
           const scanner = new Html5Qrcode(readerDomId);
           scannerRef.current = scanner;
-          await scanner.start(
-            config,
-            scanConfig,
-            (text) => {
-              const now = Date.now();
-              if (
-                text === lastScan.current.data &&
-                now - lastScan.current.time < 2500
-              )
-                return;
-              lastScan.current = { data: text, time: now };
+          await withTimeout(
+            scanner.start(
+              config,
+              scanConfig,
+              (text) => {
+                const now = Date.now();
+                if (
+                  text === lastScan.current.data &&
+                  now - lastScan.current.time < 2500
+                )
+                  return;
+                lastScan.current = { data: text, time: now };
 
-              let id = text.trim();
-              try {
-                const parsed = JSON.parse(text) as {
-                  studentId?: string;
-                  id?: string;
-                };
-                if (parsed.studentId) id = parsed.studentId;
-                else if (parsed.id) id = parsed.id;
-              } catch {
-                /* plain id */
-              }
-              processRef.current(id);
-            },
-            () => undefined
+                let id = text.trim();
+                try {
+                  const parsed = JSON.parse(text) as {
+                    studentId?: string;
+                    id?: string;
+                  };
+                  if (parsed.studentId) id = parsed.studentId;
+                  else if (parsed.id) id = parsed.id;
+                } catch {
+                  /* plain id */
+                }
+                processRef.current(id);
+              },
+              () => undefined
+            ),
+            12000,
+            "scanner.start",
           );
           started = true;
           break;
         } catch (err) {
           lastError = err;
           try {
+            await scannerRef.current?.stop();
+          } catch {
+            /* ignore */
+          }
+          try {
             scannerRef.current?.clear();
           } catch {
             /* ignore */
           }
+          releaseReaderStreams(readerDomId);
           scannerRef.current = null;
+          // Let Android release the device before the next attempt
+          await new Promise((r) => window.setTimeout(r, 250));
         }
       }
 
@@ -470,19 +550,18 @@ export function ScannerView() {
       runningRef.current = true;
       setRunning(true);
       patchScannerVideo(readerDomId);
-      // iOS sometimes mounts video a tick later
-      window.setTimeout(() => patchScannerVideo(readerDomId), 120);
-      window.setTimeout(() => patchScannerVideo(readerDomId), 400);
+      window.setTimeout(() => patchScannerVideo(readerDomId), 200);
       logConsole("Scanner Online.");
-      setTimeout(refreshCameras, 1000);
+      window.setTimeout(refreshCameras, 1000);
     } catch {
       scannerRef.current = null;
       runningRef.current = false;
       setRunning(false);
+      releaseReaderStreams(readerDomId);
       logConsole("Scanner Hardware Error: Check permissions.");
       showToast(
         "Camera Access Error",
-        "Please allow camera access inside browser/app configurations.",
+        "Please allow camera access, then tap Start Scanner again.",
         "error"
       );
     } finally {
@@ -493,7 +572,7 @@ export function ScannerView() {
   const startScannerRef = useRef(startScanner);
   startScannerRef.current = startScanner;
 
-  // Auto-start when entering Scanning Kiosk (avoids extra tap on iOS)
+  // Auto-start when entering Scanning Kiosk
   useEffect(() => {
     if (view !== "scanner") {
       wantRunningRef.current = false;
@@ -501,17 +580,20 @@ export function ScannerView() {
     }
     wantRunningRef.current = true;
     let cancelled = false;
-    const timer = window.setTimeout(() => {
-      if (cancelled) return;
+    const tryStart = () => {
+      if (cancelled || !wantRunningRef.current) return;
       void startScannerRef.current();
-    }, 280);
+    };
+    const timer = window.setTimeout(tryStart, 450);
+    const retry = window.setTimeout(tryStart, 1100);
     return () => {
       cancelled = true;
       window.clearTimeout(timer);
+      window.clearTimeout(retry);
     };
   }, [view]);
 
-  // iOS Safari pauses/blacks the camera when the tab backgrounds — resume or restart
+  // Resume carefully after tab hide — avoid restart loops that hang Android cameras
   useEffect(() => {
     let reviveTimer: number | undefined;
 
@@ -521,28 +603,38 @@ export function ScannerView() {
       }
       if (startingRef.current) return;
 
+      const now = Date.now();
+      if (now - lastReviveAtRef.current < 2500) return;
+
+      // Healthy stream → just nudge play(); do NOT full restart
+      if (runningRef.current && videoStreamAlive(readerDomId)) {
+        patchScannerVideo(readerDomId);
+        return;
+      }
+
       const video = document
         .getElementById(readerDomId)
         ?.querySelector("video") as HTMLVideoElement | null;
-
       if (runningRef.current && video) {
-        patchScannerVideo(readerDomId);
-        if (!video.paused && video.readyState >= 2) return;
         try {
           await video.play();
-          if (!video.paused && video.readyState >= 2) return;
+          if (videoStreamAlive(readerDomId)) {
+            patchScannerVideo(readerDomId);
+            return;
+          }
         } catch {
-          /* fall through to full restart */
+          /* need full restart */
         }
       }
 
+      lastReviveAtRef.current = now;
       await stopScanner();
       wantRunningRef.current = true;
       window.setTimeout(() => {
-        if (wantRunningRef.current && view === "scanner") {
+        if (wantRunningRef.current && view === "scanner" && !document.hidden) {
           void startScannerRef.current();
         }
-      }, 200);
+      }, 350);
     }
 
     function onVisibility() {
@@ -550,7 +642,7 @@ export function ScannerView() {
       window.clearTimeout(reviveTimer);
       reviveTimer = window.setTimeout(() => {
         void reviveCamera();
-      }, 350);
+      }, 600);
     }
 
     document.addEventListener("visibilitychange", onVisibility);
